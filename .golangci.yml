@@ -1,0 +1,49 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - revive
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: false
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # go-pg reads the tableName field by reflection, so every model has an unexported field
+      # that is never referenced. It is not dead code; it is the table name.
+      - path: (.+)\.go$
+        text: 'tableName'
+        linters: [unused]
+
+      # Examples are documentation. A deliberately-nil *pg.DB and an unchecked Close are what
+      # keeps them readable on pkg.go.dev.
+      - path: example_test\.go$
+        linters: [errcheck, staticcheck]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ulas96/luima
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
