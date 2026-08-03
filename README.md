@@ -1,6 +1,7 @@
 # luima
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/ulas96/luima.svg)](https://pkg.go.dev/github.com/ulas96/luima)
+[![Release](https://img.shields.io/github/v/release/ulas96/luima?logo=go&label=release)](https://github.com/ulas96/luima/releases/latest)
 [![CI](https://github.com/ulas96/luima/actions/workflows/ci.yml/badge.svg)](https://github.com/ulas96/luima/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ulas96/luima)](https://goreportcard.com/report/github.com/ulas96/luima)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
