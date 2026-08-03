@@ -1,0 +1,25 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ['*']
+
+  # The example pins the same versions; keeping it in step is what stops the quickstart from
+  # drifting away from the library it demonstrates.
+  - package-ecosystem: gomod
+    directory: /examples/quickstart
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

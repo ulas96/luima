@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25', '1.26']
+
+    # TestCRUD skips silently without DATABASE_URL, and a skipped test still reads as "ok".
+    # This service container is what stops the only test that proves anything from rotting into
+    # a permanent skip that nobody notices.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # sslmode=disable because the service container speaks plain TCP. pg.ParseURL maps it to a
+      # nil TLSConfig; anything other than its three known parameters is a hard parse error.
+      - name: go test
+        run: go test -race -count=1 ./...
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
+      - name: confirm the DB-backed test actually ran
+        run: |
+          go test -v -count=1 -run TestCRUD ./tests/ | tee out.txt
+          grep -q -- '--- PASS: TestCRUD' out.txt \
+            || { echo "::error::TestCRUD did not run — it skipped, and a skip reads as ok"; exit 1; }
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  example:
+    name: example
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/quickstart
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: build
+        run: go build ./...
+
+      # A stub compiles and panics at runtime, so this grep — not go build — is the schema check.
+      - name: no unfilled resolver stubs
+        run: |
+          if grep -rn 'not implemented' graph/*.resolvers.go; then
+            echo "::error::unfilled resolver stubs — these COMPILE and panic at runtime"; exit 1
+          fi
+
+      # Proves the committed generated code still matches schema.graphqls.
+      - name: generated code is up to date
+        run: |
+          go tool gqlgen generate
+          git diff --exit-code -- . \
+            || { echo "::error::run 'go tool gqlgen generate' and commit the result"; exit 1; }
