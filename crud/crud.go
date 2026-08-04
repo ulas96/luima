@@ -34,13 +34,20 @@ import (
 // That translation exists because a single-row Select reports absence as pg.ErrNoRows — a list
 // Select just comes back empty, which is why List never needs it.
 //
+// The opts are what make an ownership predicate expressible — see [Delete].
+//
 // @param ctx   the resolver context
 // @param db    orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param key   a model with only its primary key populated; it is filled in and returned
+// @param opts  query modifiers applied left to right, after WherePK
 // @return *T   the stored row, or nil when no row matched
 // @return error any driver error other than pg.ErrNoRows
-func Get[T any](ctx context.Context, db orm.DB, key *T) (*T, error) {
-	if err := db.ModelContext(ctx, key).WherePK().Select(); err != nil {
+func Get[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	q := db.ModelContext(ctx, key).WherePK()
+	for _, opt := range opts {
+		q = opt(q)
+	}
+	if err := q.Select(); err != nil {
 		if errors.Is(err, pg.ErrNoRows) {
 			return nil, nil
 		}
@@ -63,7 +70,15 @@ func Get[T any](ctx context.Context, db orm.DB, key *T) (*T, error) {
 //
 // @param ctx   the resolver context
 // @param db    orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
-// @param opts  query modifiers applied left to right; none means "select every row"
+// Do bound them, too. Passing no options selects every row in the table, and that is a denial of
+// service rather than a default: the rows are materialized into []*T, gqlgen marshals the whole
+// response into memory, and the fasthttp adaptor buffers it once more before writing — three
+// copies, no ceiling, reachable by anyone who can send `{ users { id } }`. ComplexityLimit does
+// not help, because the row count is not an input to the complexity calculation; a list field
+// costs the same whether it returns one row or ten million. Pagination is out of scope, so a
+// q.Limit(n) in the resolver is what stands in for it.
+//
+// @param opts  query modifiers applied left to right; none means "select every row" — see above
 // @return []*T the rows, never nil — an empty table yields an empty slice
 // @return error any driver error
 func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Query) ([]*T, error) {
@@ -129,14 +144,30 @@ func Create[T any](ctx context.Context, db orm.DB, m *T, label string) (*T, erro
 //
 // See Create for why RETURNING * is here.
 //
+// The opts are the escape hatch from both of the above. q.Column(...) narrows the SET clause to
+// the named columns, which is the partial update the full replace otherwise rules out — and it is
+// the answer to the failure mode the full replace creates, where a column present on the struct
+// but not set by your input mapper is written as its zero value on every update:
+//
+//	luima.Update(ctx, db, u, "user "+id, func(q *orm.Query) *orm.Query {
+//	    return q.Column("name", "email") // SET name = ?, email = ? — nothing else touched
+//	})
+//
+// And a q.Where(...) is what scopes the update to rows the caller owns; see [Delete].
+//
 // @param ctx    the resolver context
 // @param db     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param m      the complete model, primary key included; every column is written
 // @param label  names the thing in the not-found message
+// @param opts   query modifiers applied left to right, after WherePK
 // @return *T    the stored row
 // @return error a *luimaerr.CustomError when no row matched, the bare driver error otherwise
-func Update[T any](ctx context.Context, db orm.DB, m *T, label string) (*T, error) {
-	res, err := db.ModelContext(ctx, m).WherePK().Returning("*").Update()
+func Update[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	q := db.ModelContext(ctx, m).WherePK().Returning("*")
+	for _, opt := range opts {
+		q = opt(q)
+	}
+	res, err := q.Update()
 	if err != nil {
 		if errors.Is(err, pg.ErrNoRows) {
 			return nil, &luimaerr.CustomError{UserMessage: label + " not found"}
@@ -153,13 +184,34 @@ func Update[T any](ctx context.Context, db orm.DB, m *T, label string) (*T, erro
 //
 // @dev Nothing to classify: absence is false, not an error.
 //
+// The opts exist so authorization is expressible. luima ships no auth and does not intend to, but
+// "no auth" and "you cannot write the WHERE clause auth needs" are different things — without a
+// second predicate there is no way to say
+//
+//	DELETE FROM app_users WHERE personal_id = $1 AND owner_id = $2
+//
+// short of dropping to raw go-pg and hand-rolling the SQLSTATE classification that this package
+// exists to provide. So the helpers' happy path was IDOR by construction:
+//
+//	luima.Delete(ctx, r.DB, &model.User{PersonalID: id}, func(q *orm.Query) *orm.Query {
+//	    return q.Where("owner_id = ?", callerID(ctx))
+//	})
+//
+// A row that exists but is not yours then reports as absent, which is the right answer to give an
+// unauthorized caller anyway — it leaks no existence.
+//
 // @param ctx    the resolver context
 // @param db     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param key    a model with only its primary key populated
+// @param opts   query modifiers applied left to right, after WherePK
 // @return bool  true when a row was deleted, false when none matched
 // @return error any driver error
-func Delete[T any](ctx context.Context, db orm.DB, key *T) (bool, error) {
-	res, err := db.ModelContext(ctx, key).WherePK().Delete()
+func Delete[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (bool, error) {
+	q := db.ModelContext(ctx, key).WherePK()
+	for _, opt := range opts {
+		q = opt(q)
+	}
+	res, err := q.Delete()
 	if err != nil {
 		return false, err
 	}

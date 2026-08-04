@@ -50,6 +50,28 @@ func TestMountRoutes(t *testing.T) {
 		}
 	})
 
+	// r.All forwards every method, and gqlgen answers the ones no transport Supports with 422
+	// rather than 405 — so this is what "All" costs, and it is worth pinning next to the line the
+	// project calls its most important. Harmless: gqlgen reflects no request body, so TRACE
+	// discloses nothing.
+	t.Run("methods no transport serves reach gqlgen and are refused", func(t *testing.T) {
+		for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodTrace} {
+			res, err := app.Test(httptest.NewRequest(method, "/graphql", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+
+			if res.StatusCode == http.StatusOK {
+				t.Errorf("%s /graphql = 200 — no transport should serve it", method)
+			}
+			if strings.Contains(string(body), "pong") {
+				t.Errorf("%s /graphql executed the query: %s", method, body)
+			}
+		}
+	})
+
 	t.Run("playground on /", func(t *testing.T) {
 		assertBody(t, app, httptest.NewRequest(http.MethodGet, "/", nil), http.StatusOK, "luima-under-test")
 	})

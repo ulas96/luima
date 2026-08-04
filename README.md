@@ -280,14 +280,24 @@ func Mount(r fiber.Router, cfg Config)   // GraphQL on a router you already have
 | `Playground` | `/` | Fiber matches it **exactly** — unknown paths 404 |
 | `DisablePlayground` | `false` | do this in production |
 | `PlaygroundTitle` | `graphql` | |
+| `DisableIntrospection` | `false` | do this in production; it is not confidentiality — [why](SECURITY.md#what-luima-does-do) |
+| `RequestTimeout` | `15s` | **negative** disables; zero means unset. The only bound a query gets |
 | `QueryCache` | `1000` | **negative** disables; zero means unset |
-| `ComplexityLimit` | `1000` | **negative** disables; zero means unset |
+| `ComplexityLimit` | `1000` | **negative** disables; zero means unset. Per *field*, not per row |
 | `ErrorPresenter` | `PresentError` | |
+| `HTTPMiddleware` | `nil` | `func(http.Handler) http.Handler`, outermost first — the layer with the real `*http.Request`, working `Set-Cookie`, and a context resolvers see |
+| `Configure` | `nil` | `func(*handler.Server)`, run last — the escape hatch to `srv.Use`, `AroundOperations`, `SetRecoverFunc`, `SetDisableSuggestion` |
 | `Fiber` | `fiber.Config{}` | passed to `fiber.New`; ignored by `Mount`. Setting `ErrorHandler` here does nothing — [why](docs/fiber.md#2-fibers-errorhandler-is-unreachable--and-must-stay-that-way) |
 
-Zero means *unset* for the two limits, not *off*, because a zero-valued `Config{}` has to be the
+Zero means *unset* for the three limits, not *off*, because a zero-valued `Config{}` has to be the
 good configuration rather than the pathological one. Turning the query cache off needs a negative
 number, and there is no good reason to.
+
+`RequestTimeout` is the one that does security work rather than performance work: nothing else in
+the stack bounds a query, and go-pg turns the resolver context's deadline into the socket deadline
+and its cancellation into a Postgres `CancelRequest`. A zero `Config` is the good *development*
+configuration, not a production one — see [SECURITY.md](SECURITY.md) and
+`examples/quickstart/main.go`, which is deliberately the production shape.
 
 ### CRUD
 

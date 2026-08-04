@@ -38,6 +38,27 @@ managed Postgres therefore connects over TLS with nothing to configure — **and
 Use `?sslmode=verify-full` in production. This is stated plainly because a library that ships
 `InsecureSkipVerify` silently is doing its users a disservice.
 
+The verified rows in that table are only true because `db.Connect` fixes up the `tls.Config`.
+`pg.ParseURL` maps `verify-ca` and `verify-full` to a bare `&tls.Config{}` and never sets
+`ServerName`, and the driver plumbs no host into its `tls.Client` call either — so crypto/tls
+refuses the handshake outright with *"either ServerName or InsecureSkipVerify must be specified"*.
+Before 0.2.0 `verify-full` therefore could not connect at all, and the natural workaround was
+`?sslmode=require`, which is `InsecureSkipVerify: true`. `Connect` now fills `ServerName` in from
+the address. Two smaller notes on the same code path: go-pg treats `verify-ca` and `verify-full` as
+identical and both verify the hostname, which is stricter than Postgres's own definition of
+`verify-ca`; and `?connect_timeout=N` bounds the whole boot round trip here, not just the dial.
+
+### A DSN that lost its credentials still connects
+
+`ParseURL` defaults the user to `postgres`, and go-pg then falls back to `$PGUSER`, `$PGPASSWORD`
+and finally the literal `postgres`. A connection string mangled by a bad interpolation does not
+fail as a configuration error — it attempts `postgres/postgres`, and on a permissive local or CI
+database it *succeeds*. The `select 1` in `Connect` cannot tell "connected as the intended role"
+from "connected as the fallback".
+
+Set `?application_name=your-service` — one of the three parameters `ParseURL` accepts — so
+`pg_stat_activity` shows which service, and which role, actually connected.
+
 ### Supabase: use the session pooler on port 5432
 
 That is what this stack is tested against.
@@ -109,8 +130,18 @@ defer db.Close()
 > The error presenter redacts driver text so an unauthenticated caller cannot read your schema off
 > a failed query. That is damage control, not authorization.
 
+Your middleware passes identity to a resolver with `c.SetContext`, and the CRUD helpers take the
+query modifier that scopes a row to its owner. Both are in
+[SECURITY.md](../SECURITY.md#getting-the-callers-identity-into-a-resolver), which is the one place
+that walks the whole path.
+
 If you need per-user RLS, connect as an unprivileged role and set the request's claims per
 transaction — that is a real design, and it is out of scope for v1.
+
+`examples/quickstart/main.go` is the deployable shape: HTTP timeouts, a rate limiter, playground
+and introspection behind `LUIMA_DEV`, a bounded list query and a graceful shutdown on SIGTERM. It
+is the one file in the repo that deliberately does not use the zero `luima.Config`, because a
+library call has no deployment context and an application does.
 
 ---
 

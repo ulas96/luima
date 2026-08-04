@@ -39,9 +39,9 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
@@ -78,13 +78,35 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.25'
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6 # v9
         with:
-          version: latest
+          version: v2.12.2
+
+  # Both modules: they have different dependency graphs, since the example pulls in gqlgen's CLI
+  # through its tool directive. luima's whole job is wiring four other libraries together, so a
+  # known vulnerability in any of them is luima's problem whether or not luima's own code changed —
+  # which also means this job can start failing on a commit that changed nothing.
+  audit:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+          # Load-bearing here specifically: most of what govulncheck reports for this module is
+          # the standard library, and "fixed in" means a toolchain patch release. Pinned to the
+          # minor without this, the job reports every stdlib CVE since .0 and never goes green.
+          check-latest: true
+      - name: govulncheck the library
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: govulncheck the example
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        working-directory: examples/quickstart
 
   example:
     name: example
@@ -93,8 +115,8 @@ jobs:
       run:
         working-directory: examples/quickstart
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.25'
 

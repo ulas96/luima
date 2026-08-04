@@ -71,6 +71,13 @@ not the schema check** — gqlgen writes a stub for every unresolved schema fiel
 *compiles*, then panics when called. `grep -rn 'not implemented' graph/*.resolvers.go` is the check
 (`make example`). CI also re-runs codegen and fails on any diff.
 
+**`main.go` deliberately does not use the zero `Config`, and does not use `luima.New`.** It is an
+application, not a library call: development conveniences are opened by `LUIMA_DEV` rather than
+closed by its absence, and `fiber.New` + `luima.Mount` is required because `luima.New` mounts
+before it returns, so a later `app.Use(limiter.New())` would land behind `/graphql` and never run.
+Every other doc shows the zero `Config` as idiomatic — it is, for a library call. Do not
+"simplify" this file back to it.
+
 ## Conventions
 
 - Doc comments use NatSpec tags inside ordinary godoc comments: open with the symbol name, then

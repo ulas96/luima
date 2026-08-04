@@ -24,7 +24,15 @@ import (
 // @dev Any resolver error that is not a *CustomError is infrastructure detail as far as
 // PresentError is concerned, and is redacted.
 type CustomError struct {
-	// UserMessage @notice The text the client receives verbatim. Assume it is public.
+	// UserMessage @notice The text the client receives verbatim. Assume it is public, and
+	// assume it is untrusted.
+	//
+	// @dev Public, so never build it from another error: &CustomError{UserMessage: err.Error()}
+	// undoes the redaction in one line that reads like careful error handling, because
+	// PresentError returns this field as-is. Untrusted, because the usual way to build it is
+	// from client input — crud.Create's label is documented as "user "+id. The response is
+	// JSON, so there is no injection at luima's layer; a client that renders error messages
+	// into the DOM inherits the sink.
 	UserMessage string
 
 	// InternalError @notice The cause, kept for the log and for errors.Is/As.
@@ -76,14 +84,38 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	// so they disclose nothing about the server. They pass through unchanged — without this,
 	// every schema typo would read as "internal server error" and debugging a client would be
 	// impossible.
-	var ge *gqlerror.Error
-	if errors.As(err, &ge) {
+	//
+	// A type assertion, not errors.As, and that distinction is the whole redaction contract.
+	// errors.As walks the chain, so any error that *wraps* a *gqlerror.Error anywhere inside it
+	// would be returned whole — and one line of ordinary-looking error handling,
+	// fmt.Errorf("insert into %s failed for tenant %d: %w", table, tenantID, gqlErr), would
+	// then ship the table name and the tenant id to the client. Unwrapping here makes redaction
+	// opt-*out*. gqlgen hands its own parse and validation errors to the presenter unwrapped,
+	// so the branch this exists for is unaffected.
+	if ge, ok := err.(*gqlerror.Error); ok { //nolint:errorlint // deliberate; see above
 		return ge
 	}
 	// log.Printf on purpose. A Config.Logger field would be a second way to do what
 	// Config.ErrorPresenter already does: wrap this function, log however you like, and return
-	// what it returns.
-	log.Printf("resolver error: %v", err)
+	// what it returns:
+	//
+	//	cfg.ErrorPresenter = func(ctx context.Context, err error) *gqlerror.Error {
+	//	    slog.ErrorContext(ctx, "resolver error", "err", err)
+	//	    return luimaerr.PresentError(ctx, err)
+	//	}
+	//
+	// %q, not %v: err routinely carries attacker-controlled text — a GraphQL variable echoed
+	// back by a constraint message, or the label passed to crud.Create. %v writes newlines
+	// literally, so a caller sending "x\nresolver error: all clear" forges a second log line
+	// and anything parsing these logs per line can be lied to. %q escapes them and makes the
+	// boundary of the untrusted string visible.
+	//
+	// Note what this line is not: redaction happens on the wire, not here. A Postgres error's
+	// DETAIL field carries the offending row's values — Key (email)=(victim@example.com) — so
+	// the data withheld from the client above is written to stdout in full. That is deliberate,
+	// it is what makes an incident debuggable, and it means your log store inherits the
+	// database's confidentiality requirements. See SECURITY.md.
+	log.Printf("resolver error: %q", err)
 	return gqlerror.WrapPath(graphql.GetPath(ctx), errors.New("internal server error"))
 }
 

@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -29,6 +30,15 @@ func TestPresentError(t *testing.T) {
 	}
 	if got := luimaerr.PresentError(ctx, leak).Message; got != "internal server error" {
 		t.Errorf("raw driver error presented as %q — it must not reach the client", got)
+	}
+
+	// The gqlerror branch must match only what it claims to match. Assert with errors.As
+	// instead of a type assertion and this case passes the wrapper straight through, message
+	// and all — which turns redaction from opt-in into opt-out, since any resolver that wraps a
+	// gqlerror while adding context is then exempt from it.
+	wrapped := fmt.Errorf("insert into app_users failed for tenant 42: %w", gqlerror.Errorf("inner"))
+	if got := luimaerr.PresentError(ctx, wrapped).Message; got != "internal server error" {
+		t.Errorf("error wrapping a gqlerror presented as %q — it bypassed redaction", got)
 	}
 }
 

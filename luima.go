@@ -109,10 +109,11 @@ func SQLState(err error) string { return luimaerr.SQLState(err) }
 // @param ctx   the resolver context
 // @param d     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param key   a model with only its primary key populated
+// @param opts  query modifiers applied left to right, after WherePK
 // @return *T   the stored row, or nil when no row matched. See [crud.Get].
 // @return error any driver error other than pg.ErrNoRows
-func Get[T any](ctx context.Context, d orm.DB, key *T) (*T, error) {
-	return crud.Get[T](ctx, d, key)
+func Get[T any](ctx context.Context, d orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	return crud.Get[T](ctx, d, key, opts...)
 }
 
 // List @notice Selects rows, applying each opt to the query in order.
@@ -144,10 +145,12 @@ func Create[T any](ctx context.Context, d orm.DB, m *T, label string) (*T, error
 // @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param m      the complete model, primary key included; every column is written
 // @param label  names the thing in the not-found message
+// @param opts   query modifiers applied left to right, after WherePK; q.Column(...) narrows the
+// SET clause, q.Where(...) scopes the update to rows the caller owns
 // @return *T    the stored row. See [crud.Update].
 // @return error a *CustomError when no row matched, the bare driver error otherwise
-func Update[T any](ctx context.Context, d orm.DB, m *T, label string) (*T, error) {
-	return crud.Update[T](ctx, d, m, label)
+func Update[T any](ctx context.Context, d orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	return crud.Update[T](ctx, d, m, label, opts...)
 }
 
 // Delete @notice Removes the row with key's primary key, reporting whether one was there.
@@ -155,8 +158,10 @@ func Update[T any](ctx context.Context, d orm.DB, m *T, label string) (*T, error
 // @param ctx    the resolver context
 // @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param key    a model with only its primary key populated
+// @param opts   query modifiers applied left to right, after WherePK; this is where an ownership
+// predicate goes
 // @return bool  true when a row was deleted, false when none matched. See [crud.Delete].
 // @return error any driver error
-func Delete[T any](ctx context.Context, d orm.DB, key *T) (bool, error) {
-	return crud.Delete[T](ctx, d, key)
+func Delete[T any](ctx context.Context, d orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (bool, error) {
+	return crud.Delete[T](ctx, d, key, opts...)
 }

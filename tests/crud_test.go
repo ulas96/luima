@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -23,6 +24,12 @@ type testUser struct {
 	PersonalID string   `pg:"personal_id,pk"`
 	Name       string   `pg:"name"`
 	Projects   []string `pg:"projects,array"`
+
+	// Owner @notice Stands in for whatever column your authorization actually keys on.
+	//
+	// @dev Deliberately nullable in the table and deliberately without ,use_zero, because that
+	// pair is the shape the full replace corrupts silently — see testPartialUpdate.
+	Owner string `pg:"owner"`
 }
 
 // TestCRUD @notice The round trip against a real Postgres.
@@ -47,7 +54,8 @@ func TestCRUD(t *testing.T) {
 	if _, err := conn.Exec(`create table if not exists luima_test_users (
 		personal_id text primary key,
 		name        text not null,
-		projects    text[] not null default '{}'
+		projects    text[] not null default '{}',
+		owner       text
 	)`); err != nil {
 		t.Fatal(err)
 	}
@@ -173,10 +181,144 @@ func TestCRUD(t *testing.T) {
 			return err
 		}
 		return pg.ErrTxDone // roll back
-	}); err != pg.ErrTxDone {
+	}); !errors.Is(err, pg.ErrTxDone) {
 		t.Errorf("RunInTransaction = %v, want the rollback sentinel", err)
 	}
 	if after, err := crud.Get(ctx, conn, &testUser{PersonalID: "L-tx"}); err != nil || after != nil {
 		t.Errorf("row survived a rolled-back transaction: %+v, %v", after, err)
+	}
+
+	t.Run("ownership predicate", func(t *testing.T) { testOwnership(ctx, t, conn) })
+	t.Run("partial update", func(t *testing.T) { testPartialUpdate(ctx, t, conn) })
+}
+
+// testOwnership @notice Asserts the opts variadic actually scopes Get, Update and Delete.
+//
+// @dev This is the whole point of the variadic. Without it Get, Update and Delete are hard-wired
+// to WherePK alone, so `WHERE personal_id = $1 AND owner_id = $2` — the query authorization
+// actually needs — is inexpressible, and every helper is an IDOR by construction. luima ships no
+// auth by design; being unable to *write* the predicate is a different thing, and a gap in the
+// API rather than in the scope.
+//
+// @param ctx  the query context
+// @param t    the test handle
+// @param conn the live pool
+func testOwnership(ctx context.Context, t *testing.T, conn *pg.DB) {
+	t.Helper()
+
+	ownedBy := func(who string) func(*orm.Query) *orm.Query {
+		return func(q *orm.Query) *orm.Query { return q.Where("owner = ?", who) }
+	}
+
+	for _, u := range []*testUser{
+		{PersonalID: "own-a", Name: "A", Owner: "alice"},
+		{PersonalID: "own-b", Name: "B", Owner: "bob"},
+	} {
+		if _, err := crud.Create(ctx, conn, u, "user "+u.PersonalID); err != nil {
+			t.Fatalf("Create %s: %v", u.PersonalID, err)
+		}
+	}
+
+	// Alice asking for Bob's row gets the same answer as asking for a row that does not exist,
+	// which is the correct answer to give an unauthorized caller — it leaks no existence.
+	if got, err := crud.Get(ctx, conn, &testUser{PersonalID: "own-b"}, ownedBy("alice")); err != nil || got != nil {
+		t.Errorf("scoped Get of another owner's row = %+v, %v — want (nil, nil)", got, err)
+	}
+	if got, err := crud.Get(ctx, conn, &testUser{PersonalID: "own-a"}, ownedBy("alice")); err != nil || got == nil {
+		t.Errorf("scoped Get of your own row = %+v, %v — want the row", got, err)
+	}
+
+	_, err := crud.Update(ctx, conn, &testUser{PersonalID: "own-b", Name: "hijacked"}, "user own-b", ownedBy("alice"))
+	if err == nil {
+		t.Error("scoped Update across owners succeeded")
+	} else if msg := luimaerr.PresentError(ctx, err).Message; !strings.Contains(msg, "not found") {
+		t.Errorf("scoped Update across owners presented as %q, want %q", msg, "not found")
+	}
+
+	if deleted, err := crud.Delete(ctx, conn, &testUser{PersonalID: "own-b"}, ownedBy("alice")); err != nil || deleted {
+		t.Errorf("scoped Delete across owners = %v, %v — want false", deleted, err)
+	}
+	// The row has to still be there. A Delete that reported false while deleting anyway would
+	// pass the assertion above and lose the data.
+	if survived, err := crud.Get(ctx, conn, &testUser{PersonalID: "own-b"}); err != nil || survived == nil {
+		t.Fatalf("Bob's row did not survive Alice's scoped Delete: %+v, %v", survived, err)
+	}
+
+	if deleted, err := crud.Delete(ctx, conn, &testUser{PersonalID: "own-b"}, ownedBy("bob")); err != nil || !deleted {
+		t.Errorf("scoped Delete by the real owner = %v, %v — want true", deleted, err)
+	}
+	if _, err := crud.Delete(ctx, conn, &testUser{PersonalID: "own-a"}); err != nil {
+		t.Errorf("cleanup Delete: %v", err)
+	}
+}
+
+// testPartialUpdate @notice Pins both halves of the full-replace trade-off.
+//
+// @dev Update writes every column, so a column present on the struct but not set by your input
+// mapper is written on every call — add `Role string` to a model, forget to touch the mapper, and
+// every update clobbers that user's role.
+//
+// And it writes NULL, not the zero value. go-pg's Field.AppendValue emits NULL for any zero-valued
+// field whose tag lacks ,use_zero (NullZero() is !hasFlag(UseZeroFlag)), so what a forgotten mapper
+// field actually does depends on the column: NOT NULL turns it into a loud 23502, which is the
+// lucky case, and a nullable column takes the NULL silently. `pg:"owner,use_zero"` is the tag that
+// changes it to "". The second assertion here documents that in code, because a footgun nobody
+// executes is still a footgun.
+//
+// The first assertion is the escape hatch: q.Column(...) narrows the SET clause, which is what
+// makes a real partial update expressible through the same helper. It rests on go-pg honouring
+// the column list in appendSetStruct rather than only for the SELECT, so it is worth pinning
+// rather than assuming.
+//
+// @param ctx  the query context
+// @param t    the test handle
+// @param conn the live pool
+func testPartialUpdate(ctx context.Context, t *testing.T, conn *pg.DB) {
+	t.Helper()
+
+	const id = "partial-1"
+	if _, err := crud.Create(ctx, conn, &testUser{PersonalID: id, Name: "before", Owner: "alice", Projects: []string{}}, "user "+id); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := crud.Delete(ctx, conn, &testUser{PersonalID: id}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	// Owner is deliberately left zero on the model, exactly as a forgetful mapper would.
+	cols := func(q *orm.Query) *orm.Query { return q.Column("name") }
+	if _, err := crud.Update(ctx, conn, &testUser{PersonalID: id, Name: "after", Projects: []string{}}, "user "+id, cols); err != nil {
+		t.Fatalf("Update with Column: %v", err)
+	}
+
+	got, err := crud.Get(ctx, conn, &testUser{PersonalID: id})
+	if err != nil || got == nil {
+		t.Fatalf("Get: %+v, %v", got, err)
+	}
+	if got.Name != "after" {
+		t.Errorf("name = %q, want %q — Column(\"name\") must still write the column it names", got.Name, "after")
+	}
+	if got.Owner != "alice" {
+		t.Errorf("owner = %q, want %q — Column(...) must not touch columns it does not name", got.Owner, "alice")
+	}
+
+	// And the other half: a plain Update clobbers it. This is not a bug report, it is the
+	// documented full replace — but it becomes a security one the moment the clobbered column is
+	// an authorization column, so it is asserted rather than described.
+	if _, err := crud.Update(ctx, conn, &testUser{PersonalID: id, Name: "after", Projects: []string{}}, "user "+id); err != nil {
+		t.Fatalf("plain Update: %v", err)
+	}
+
+	// Asserted against the database rather than through Get, because the distinction does not
+	// survive the scan: a NULL text column reads back into a Go string as "". NULL is what makes
+	// this sharper than "the column is blanked" — a NOT NULL column raises 23502 instead, so the
+	// constraint you did not think of as a safety feature is the only thing that makes this loud.
+	var isNull bool
+	if _, err := conn.QueryOne(pg.Scan(&isNull), "select owner is null from luima_test_users where personal_id = ?", id); err != nil {
+		t.Fatal(err)
+	}
+	if !isNull {
+		t.Error("owner survived a plain Update — go-pg writes NULL for a zero-valued field without ,use_zero, and this test is what documents that")
 	}
 }
