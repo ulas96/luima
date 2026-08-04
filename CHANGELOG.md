@@ -10,6 +10,27 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-05
+
+Documentation only. No code changed, so there is nothing to upgrade for — `v0.2.0` and `v0.2.1`
+are the same library.
+
+### Added
+
+- **[docs/security-review.md](docs/security-review.md)** — the component-by-component review of
+  0.1.0 that produced `v0.2.0`, and the reasoning behind each fix. It was written but never
+  tracked, which `v0.2.0` shipped a dangling reference to: `tests/context_test.go` cites
+  "D-02 in docs/security-review.md" by finding ID. Left as written, against 0.1.0 — the
+  "what breaks if you remove this line" arguments are what stop the fixes being undone — with a
+  status banner and per-finding markers so it cannot be misread as a report on the current
+  release. What is still open (S-06, S-07, C-05, D-04, and half of E-03) is named in the fix list.
+- **`AUTH_HANDOUT.md`** and **`AUTH_INTEGRATION.md`** — the build specification for
+  [kal](https://github.com/ulas96/kal), the auth library built against the seams this release
+  line froze. They live here because this is the repository that owns those seams:
+  `HTTPMiddleware`, `Configure` and the `crud` query options each exist for a reason recorded
+  only in these two documents, and the next person to touch `Mount` needs to know what is
+  pressing on them. luima itself still ships no auth, and none is planned — see `SECURITY.md`.
+
 ## [0.2.0] — 2026-08-05
 
 A security remediation pass, plus the two seams it showed were missing. Everything below is
@@ -134,6 +155,7 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ulas96/luima/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ulas96/luima/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ulas96/luima/releases/tag/v0.1.0
