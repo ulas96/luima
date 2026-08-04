@@ -22,7 +22,17 @@ import (
 //
 // @dev Enough to route against, and no more: these tests assert wiring, not execution. A real
 // generated schema would drag gqlgen codegen into the test module for no added coverage.
-type stubSchema struct{ schema *ast.Schema }
+type stubSchema struct {
+	schema *ast.Schema
+
+	// exec @notice Overrides the fixed payload, so a test can read the resolver's context.
+	//
+	// @dev This is the only seam that sees what a real resolver sees. The context propagation,
+	// timeout and cancellation tests all assert from in here, because that is the one place
+	// where "the deadline reached the resolver" is distinguishable from "the deadline existed
+	// somewhere in the middleware chain".
+	exec func(context.Context) *graphql.Response
+}
 
 // Schema @notice Returns the parsed AST the handler validates queries against.
 //
@@ -40,11 +50,17 @@ func (s stubSchema) Complexity(context.Context, string, string, int, map[string]
 	return 0, false
 }
 
-// Exec @notice Returns a handler that answers with a fixed payload.
+// Exec @notice Returns a handler that answers with a fixed payload, or with s.exec when set.
+//
+// @dev The ctx passed to the returned handler is the one gqlgen built from the *http.Request, so
+// it is exactly what a generated resolver receives.
 //
 // @return graphql.ResponseHandler a function yielding {"ping":"pong"} for every operation
 func (s stubSchema) Exec(context.Context) graphql.ResponseHandler {
-	return func(context.Context) *graphql.Response {
+	return func(ctx context.Context) *graphql.Response {
+		if s.exec != nil {
+			return s.exec(ctx)
+		}
 		return &graphql.Response{Data: []byte(`{"ping":"pong"}`)}
 	}
 }
@@ -56,8 +72,20 @@ func (s stubSchema) Exec(context.Context) graphql.ResponseHandler {
 //
 // @return graphql.ExecutableSchema a schema with the single field `Query.ping: String`
 func newStubSchema() graphql.ExecutableSchema {
-	return stubSchema{gqlparser.MustLoadSchema(&ast.Source{
-		Name:  "test",
-		Input: "type Query { ping: String }",
-	})}
+	return newStubSchemaFunc(nil)
+}
+
+// newStubSchemaFunc @notice The same stub, answering through exec so a test can read the
+// resolver's context.
+//
+// @param exec  the resolver body, or nil for the fixed {"ping":"pong"}
+// @return graphql.ExecutableSchema a schema with the single field `Query.ping: String`
+func newStubSchemaFunc(exec func(context.Context) *graphql.Response) graphql.ExecutableSchema {
+	return stubSchema{
+		schema: gqlparser.MustLoadSchema(&ast.Source{
+			Name:  "test",
+			Input: "type Query { ping: String }",
+		}),
+		exec: exec,
+	}
 }

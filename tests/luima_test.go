@@ -38,20 +38,26 @@ var (
 	// instantiates to exactly the signature of the crud original. Assigning both to one
 	// typed var is the compile-time assertion — funcs cannot be compared to each other.
 	// Nothing here runs, and none of it needs a database.
-	_, _ getFn   = luima.Get[row], crud.Get[row]
-	_, _ listFn  = luima.List[row], crud.List[row]
-	_, _ writeFn = luima.Create[row], crud.Create[row]
-	_, _ writeFn = luima.Update[row], crud.Update[row]
-	_, _ delFn   = luima.Delete[row], crud.Delete[row]
+	_, _ getFn    = luima.Get[row], crud.Get[row]
+	_, _ listFn   = luima.List[row], crud.List[row]
+	_, _ createFn = luima.Create[row], crud.Create[row]
+	_, _ updateFn = luima.Update[row], crud.Update[row]
+	_, _ delFn    = luima.Delete[row], crud.Delete[row]
 )
 
-// The four shapes the CRUD five instantiate to. Declared as aliases so the assertions above read
-// as one type per line.
+// The shapes the CRUD five instantiate to. Declared as aliases so the assertions above read as one
+// type per line.
+//
+// All but Create take the query-modifier variadic: Get, Update and Delete need it so an ownership
+// predicate is expressible at all, and List has always had it. Create is the exception because an
+// INSERT has no WHERE clause to scope.
 type (
-	getFn   = func(context.Context, orm.DB, *row) (*row, error)
-	listFn  = func(context.Context, orm.DB, ...func(*orm.Query) *orm.Query) ([]*row, error)
-	writeFn = func(context.Context, orm.DB, *row, string) (*row, error)
-	delFn   = func(context.Context, orm.DB, *row) (bool, error)
+	opt      = func(*orm.Query) *orm.Query
+	getFn    = func(context.Context, orm.DB, *row, ...opt) (*row, error)
+	listFn   = func(context.Context, orm.DB, ...opt) ([]*row, error)
+	createFn = func(context.Context, orm.DB, *row, string) (*row, error)
+	updateFn = func(context.Context, orm.DB, *row, string, ...opt) (*row, error)
+	delFn    = func(context.Context, orm.DB, *row, ...opt) (bool, error)
 )
 
 // TestShimsDispatch @notice A smoke test: every re-exported function must actually reach the

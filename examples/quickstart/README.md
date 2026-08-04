@@ -20,11 +20,17 @@ create table if not exists app_users (
   projects    text[] not null default '{}'
 );"
 
-export DATABASE_URL='postgres://...'   # unquoted in .env; see docs/deployment.md
+export DATABASE_URL=postgres://...   # unquoted — see docs/deployment.md
+export LUIMA_DEV=1                   # playground and introspection; omit in production
 go run .
 ```
 
 Playground on <http://localhost:8080>, API on <http://localhost:8080/graphql>.
+
+`main.go` is the one file here that does not use the zero `luima.Config`. Without `LUIMA_DEV` it
+runs the production shape — no playground, no introspection, HTTP timeouts set, a rate limiter,
+and a graceful shutdown on SIGTERM. That inversion is deliberate: forgetting an environment
+variable should cost you a playground, not expose one.
 
 ```graphql
 mutation {

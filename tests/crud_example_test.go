@@ -132,6 +132,49 @@ func ExampleDelete() {
 	fmt.Println(deleted)
 }
 
+// ExampleDelete_scoped @notice Deleting only if the caller owns the row.
+//
+// @dev Get, Update and Delete take the same query modifiers List does, and this is what they are
+// for. Without a second predicate the statement is WHERE personal_id = $1 alone, so any caller who
+// can reach the port can delete any row — and the alternative was dropping to raw go-pg and
+// hand-rolling the SQLSTATE classification these helpers exist to provide.
+//
+// A row that exists but is not the caller's comes back false, exactly as a row that does not exist
+// does. That is the right answer to give an unauthorized caller: it discloses no existence.
+func ExampleDelete_scoped() {
+	var db *pg.DB
+	ctx := context.Background()
+	caller := "u-42" // from your auth middleware; see SECURITY.md
+
+	deleted, err := crud.Delete(ctx, db, &User{PersonalID: "E-1042"}, func(q *orm.Query) *orm.Query {
+		return q.Where("owner_id = ?", caller)
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(deleted)
+}
+
+// ExampleUpdate_columns @notice Writing only the columns you name.
+//
+// @dev Update is a full replace, so a column on the struct that your input mapper does not set is
+// written anyway — and go-pg writes NULL, not the zero value, for any field without ,use_zero. Add
+// a Role column, forget to touch the mapper, and every update clears it. q.Column narrows the SET
+// clause to the named columns, which is the partial update the full replace otherwise rules out.
+func ExampleUpdate_columns() {
+	var db *pg.DB
+	ctx := context.Background()
+
+	updated, err := crud.Update(ctx, db, &User{PersonalID: "E-1042", Name: "Ada"}, "user E-1042",
+		func(q *orm.Query) *orm.Query {
+			return q.Column("name") // SET name = ? — company, projects and role untouched
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(updated.Name)
+}
+
 // ExampleCreate_transaction @notice Composing several helpers into one transaction.
 //
 // @dev Every helper takes orm.DB, which *pg.DB, *pg.Conn and *pg.Tx all satisfy — so passing the

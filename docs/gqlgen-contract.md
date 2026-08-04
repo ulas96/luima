@@ -176,7 +176,7 @@ type User struct {
 
 ```
 require (
-    github.com/ulas96/luima v0.1.0
+    github.com/ulas96/luima v0.2.0
     github.com/99designs/gqlgen v0.17.94
 )
 

@@ -34,6 +34,13 @@ below expand the ones that need more than a row.
 | 24 | `go run` sees no environment | Plain `source .env` does not export | `set -a && . ./.env && set +a` |
 | 25 | A whole type's fields suddenly run concurrently | `resolver: true` makes `Field.IsConcurrent()` true | Only add it with a dataloader in hand |
 | 26 | `go test ./...` green, nothing actually verified | DB-backed tests `t.Skip` without `DATABASE_URL` | Run `-v`, confirm the test ran ([below](#26-a-green-test-run-proves-less-than-it-looks)) |
+| 27 | A column your mapper forgot is `NULL` after every update | `Update` is a full replace, and go-pg writes `NULL` — not `""` — for a zero-valued field | Name the columns: `q.Column("name", "email")` ([below](#27-update-writes-every-column-as-null)) |
+| 28 | Every column is client-writable | `autobind` bound your DB model as the GraphQL `input` | Separate `input` type; never name one after a model struct ([below](#28-autobind-mass-assignment)) |
+| 29 | Anyone can read or delete anyone's row | `WherePK()` alone; no ownership predicate | Pass one: `q.Where("owner_id = ?", …)` ([security](../SECURITY.md#getting-the-callers-identity-into-a-resolver)) |
+| 30 | Your signup mutation confirms which emails are registered | `Create`'s `label` reaches the client on a unique violation | Constant label for enumeration-sensitive tables ([below](#30-create-s-label-is-an-existence-oracle)) |
+| 31 | SQL injection through a "safe" ORM | `OrderExpr`/`ColumnExpr`/`Having` interpolate raw SQL by design | Allowlist client-supplied identifiers ([below](#31-the-injection-surface-is-the-options-closure)) |
+| 32 | Check-then-write races under load | Each helper is one autocommitted statement | `db.RunInTransaction` + `q.For("UPDATE")` |
+| 33 | A DSN that lost its credentials connects anyway | go-pg falls back to `$PGUSER`/`$PGPASSWORD`, then literal `postgres` | Set `application_name` and check `pg_stat_activity` |
 
 ---
 
@@ -120,4 +127,119 @@ a permanently-skipped test that nobody notices.
 
 ---
 
-See also: [The gqlgen contract](gqlgen-contract.md) · [Fiber](fiber.md) · [Deployment](deployment.md)
+## #27 `Update` writes every column, as `NULL`
+
+`crud.Update` is a full replace — [deliberately](../crud/crud.go), because `UpdateNotZero` cannot
+clear a column and that is a silent data-retention bug. The cost is the mirror image. Your model is
+built by a hand-written mapper, and any column on the struct the mapper does not set is written
+anyway:
+
+```go
+type User struct {
+    PersonalID string `pg:"personal_id,pk"`
+    Name       string `pg:"name"`
+    Role       string `pg:"role"`      // ← added later
+}
+
+func newUser(id string, in model.UserInput) *User {
+    return &User{PersonalID: id, Name: in.Name}   // ← Role forgotten
+}
+```
+
+Every `updateUser` call now clobbers `role`. `go build` is happy, the tests are happy, and the
+response — built from `RETURNING *`, which is otherwise a virtue — shows the clobbered value as
+though it were intended.
+
+**And it writes `NULL`, not `""`.** go-pg's `Field.AppendValue` emits `NULL` for any zero-valued
+field whose tag lacks `,use_zero`. So what actually happens depends on the column, and the more
+dangerous case is the quiet one:
+
+| column | result |
+|---|---|
+| `role text not null` | `ERROR #23502 null value in column "role"` — loud, and the constraint is the only reason |
+| `role text` | silently `NULL` |
+| `pg:"role,use_zero"` | silently `''` |
+
+This is a security bug whenever the clobbered column is an authorization column — `owner_id`,
+`deleted_at`, `password_hash`. The fix is to name the columns you mean to write:
+
+```go
+luima.Update(ctx, db, u, "user "+id, func(q *orm.Query) *orm.Query {
+    return q.Column("name", "email") // SET name = ?, email = ? — nothing else touched
+})
+```
+
+`TestCRUD/partial_update` asserts both halves, so neither can drift.
+
+---
+
+## #28 `autobind` mass assignment
+
+`gqlgen.yml` points `autobind` at your model package, so **any** GraphQL type whose name matches a
+struct there binds to it — inputs included. Write `input User { … }` and your database model
+becomes the input type: every column client-writable, including `role`, `owner_id` and anything
+else you never meant to expose. Combined with #27, the client then also controls what a partial
+update leaves behind.
+
+The quickstart avoids this by having a separate `UserInput`. Nothing enforces it — keep input
+types and model structs in disjoint namespaces, and treat a codegen diff that starts binding an
+input to a model as the security review it is.
+
+---
+
+## #30 `Create`'s `label` is an existence oracle
+
+`crud.Create` builds `label + " already exists"` from caller-supplied text and returns it on a
+unique violation. That is the whole point of the helper — a duplicate has to reach the client. On a
+signup-shaped mutation it is also textbook account enumeration: send an email address, learn from
+the error whether it is registered.
+
+Working as designed, but the design has a name. For an enumeration-sensitive table use a constant
+label and keep the real detail in the log:
+
+```go
+if _, err := luima.Create(ctx, db, u, "that record"); err != nil { … }
+```
+
+The trade-off is real, not free: the label is the only thing distinguishing a duplicate from a
+redacted internal error, so shortening it costs the client that distinction.
+
+Second-order: the label is attacker-controlled text returned verbatim in `errors[].message`. The
+response is JSON, so there is no injection at luima's layer — a client that renders error messages
+into the DOM inherits the sink.
+
+---
+
+## #31 The injection surface is the options closure
+
+Nothing in `crud` is SQL-injectable. go-pg parameterizes values, and identifiers come from struct
+tags resolved at compile time. The surface is next door.
+
+`List` hands you a `*orm.Query`, and filtering and pagination are out of scope — so you *will*
+write that code, and `q.OrderExpr`, `q.ColumnExpr`, `q.Having` and `q.Where(fmt.Sprintf(…))` all
+interpolate raw SQL by design. A client-supplied sort column reaching `OrderExpr` is an injection;
+reaching `Order` is not, because `Order` quotes a single-token identifier — a distinction nobody
+should have to rely on.
+
+```go
+q.Where("name = ?", v)        // values: parameterized
+q.Where("x = ?", pg.Ident(c)) // identifiers: quoted
+pg.Safe("count(*) > 3")       // a fragment you have read and vetted
+```
+
+For a client-supplied sort column, use an allowlist, not an escape:
+
+```go
+var sortable = map[string]string{"name": "name", "created": "created_at"}
+col, ok := sortable[input.SortBy]
+if !ok {
+    return nil, &luimaerr.CustomError{UserMessage: "unknown sort field"}
+}
+return q.Order(col)
+```
+
+This belongs in luima's docs precisely *because* the design pushes the code onto you.
+
+---
+
+See also: [The gqlgen contract](gqlgen-contract.md) · [Fiber](fiber.md) · [Deployment](deployment.md) · [Security](../SECURITY.md)

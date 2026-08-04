@@ -10,6 +10,85 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-05
+
+A security remediation pass, plus the two seams it showed were missing. Everything below is
+source-compatible: the CRUD signature changes are variadic additions, and the four new `Config`
+fields have working zero values. No migration required.
+
+The one behaviour change to know about: requests now carry a 15s deadline by default. If you have
+resolvers that legitimately run longer, set `RequestTimeout` before upgrading.
+
+### Security
+
+- **`luimaerr.PresentError` no longer unwraps to find a `*gqlerror.Error`.** It matched with
+  `errors.As`, which walks the chain, so any error *wrapping* a `gqlerror` was returned whole —
+  `fmt.Errorf("insert into %s failed for tenant %d: %w", table, tenantID, gqlErr)` reached the
+  client verbatim. Redaction was effectively opt-out. It is now a type assertion on the top-level
+  error; gqlgen delivers its own parse and validation errors unwrapped, so nothing legitimate
+  changes.
+- **The resolver error log escapes its input.** `%v` → `%q`. `err` routinely carries
+  attacker-controlled text, and `%v` writes newlines literally, so a caller sending
+  `"x\nresolver error: all clear"` could forge a log line.
+- **`db.Connect` no longer puts the connection string in its error.** A malformed DSN produced a
+  `*url.Error`, which embeds the raw URL — password included — and the quickstart calls
+  `log.Fatal` on it.
+- **`crud.Get`, `crud.Update` and `crud.Delete` can express an ownership predicate.** They were
+  hard-wired to `WherePK()`, so `WHERE personal_id = $1 AND owner_id = $2` was inexpressible
+  without dropping to raw go-pg and hand-rolling the SQLSTATE classification the package exists to
+  provide. luima still ships no auth; it no longer prevents you from writing it.
+
+### Added
+
+- **`Config.RequestTimeout`** — a deadline on the whole request, propagated into the resolver
+  context. Default 15s, negative disables. Previously nothing bounded a query at any layer: go-pg
+  sets no read or write timeout, `pg.ParseURL` rejects `statement_timeout` in the DSN, and the
+  resolver context had no deadline to inherit.
+- **`Config.DisableIntrospection`** — the sibling `DisablePlayground` never had. Turning
+  introspection off previously meant abandoning `Mount`.
+- **The resolver receives a real `context.Context`.** `Mount` now uses
+  `adaptor.HTTPHandlerWithContext` and re-attaches Fiber's request context. Before, it was the raw
+  `*fasthttp.RequestCtx`: no deadline, cancelled only at server shutdown, and everything a
+  middleware put in `c.SetContext` was silently discarded. `c.Locals` still reaches
+  `ctx.Value` — the re-attached context falls back to fasthttp's user values, so consumers on that
+  path are unaffected.
+- **`Config.HTTPMiddleware`** — `[]func(http.Handler) http.Handler`, wrapped around the gqlgen
+  handler, outermost first, inside the context re-attach: a middleware receives the real request
+  context — `RequestTimeout` deadline included — whatever it adds with `r.WithContext` reaches
+  every resolver typed, and a `Set-Cookie` it writes survives the adaptor. The mount point for
+  anything written against `net/http`: logging, tracing, tenancy, rate limiting, a session layer.
+- **`Config.Configure`** — `func(*handler.Server)`, run after luima's defaults and immediately
+  before mounting, so it can override them. The escape hatch for `Use`, `AroundOperations`,
+  `SetRecoverFunc`, `SetParserTokenLimit` and `SetDisableSuggestion`, none of which were reachable
+  while `srv` stayed a local inside `Mount`.
+- **`opts ...func(*orm.Query) *orm.Query`** on `Get`, `Update` and `Delete`, matching `List`. On
+  `Update`, `q.Column(...)` is also the partial update the full replace otherwise rules out.
+- **`make audit`** — `govulncheck` over both modules, wired into `make check` and CI.
+
+### Fixed
+
+- **`?sslmode=verify-full` can connect.** `pg.ParseURL` builds the `tls.Config` for `verify-ca`
+  and `verify-full` but never sets `ServerName`, and crypto/tls refuses a handshake without it. The
+  one mode that verifies anything failed at boot, and four documents said otherwise. `Connect` now
+  fills it in from the address.
+- **`db.Connect` cannot hang forever.** The boot-time `select 1` ran with no context and no
+  deadline — `DialTimeout` bounds the dial only, and go-pg leaves the read and write timeouts at
+  zero — so a host that completed the TCP handshake and then stalled blocked startup indefinitely.
+  It is now bounded by `?connect_timeout=N`, defaulting to 5s.
+
+### Changed
+
+- `examples/quickstart` is the production shape, with the playground and introspection opened by
+  `LUIMA_DEV` rather than closed by its absence. It also sets the HTTP timeouts, adds a rate
+  limiter, bounds its `users` query at 100 rows, and shuts down gracefully on SIGTERM. The library
+  default is unchanged: a zero `Config` is still the good *development* configuration.
+- `errorlint` added to `.golangci.yml` — the linter that would have caught the redaction bug above.
+  CI actions are SHA-pinned and `golangci-lint` is version-pinned.
+- `Connect` keeps its single-argument signature. A `Connect(url, opts ...func(*pg.Options))` was
+  considered and rejected: a context deadline already bounds the pool wait, the socket and the
+  running backend, so `RequestTimeout` covers what the variadic was for. Tuning `pg.Options`
+  genuinely needs is a matter of calling `pg.ParseURL` and `pg.Connect` yourself.
+
 ## [0.1.0] — 2026-08-03
 
 Initial release.
@@ -55,5 +134,6 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ulas96/luima/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ulas96/luima/releases/tag/v0.1.0

@@ -82,12 +82,30 @@ Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it gives no way t
 presenter, which makes the [error contract](../README.md#errors) impossible.
 
 ```go
-srv.AddTransport(transport.Options{})  // CORS preflight, for browser clients
+srv.AddTransport(transport.Options{})  // answers the OPTIONS preflight
 srv.AddTransport(transport.GET{})
 srv.AddTransport(transport.POST{})
 ```
 
 `handler.New` adds none. Without `Options{}`, see consequence 1 above.
+
+**`transport.Options` is not CORS.** It sets exactly one header — `Allow` — and returns 200. That
+fixes the 405; it does not make a cross-origin request work, because no
+`Access-Control-Allow-Origin` is set by luima anywhere. A preflight that returns 200 without one
+still fails in the browser. If you need cross-origin access, add Fiber's own middleware, with
+explicit origins:
+
+```go
+app.Use(cors.New(cors.Config{AllowOrigins: []string{"https://app.example.com"}}))
+luima.Mount(app, cfg)
+```
+
+Explicit, because `cors.New()` with no config defaults to `AllowOrigins: []string{"*"}`. That is
+not catastrophic on its own — `AllowCredentials` defaults to `false`, so cookies are not sent
+cross-origin — but it becomes a data leak the moment your auth is a header token your own SPA
+holds, or you flip `AllowCredentials` to make cookie auth work.
+
+(`HEAD`, while you are here: `Options.Do` answers it with 405. Nothing depends on it.)
 
 ```go
 srv.SetQueryCache(lru.New[*ast.QueryDocument](n))

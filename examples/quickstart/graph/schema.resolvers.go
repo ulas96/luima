@@ -32,7 +32,7 @@ func (r *mutationResolver) DeleteUser(ctx context.Context, personalID string) (b
 // Users is the resolver for the users field.
 func (r *queryResolver) Users(ctx context.Context) ([]*model.User, error) {
 	return luima.List[model.User](ctx, r.DB, func(q *orm.Query) *orm.Query {
-		return q.Order("personal_id")
+		return q.Order("personal_id").Limit(100)
 	})
 }
 
