@@ -9,8 +9,6 @@
 GraphQL servers in Go on [Fiber v3](https://github.com/gofiber/fiber) +
 [gqlgen](https://github.com/99designs/gqlgen) + [go-pg](https://github.com/go-pg/pg).
 
-The pitch is "Apollo Server, in Go". The honest description is: **the boilerplate between gqlgen
-and Fiber, minus the parts you would get wrong.**
 
 ```go
 app := luima.New(luima.Config{
