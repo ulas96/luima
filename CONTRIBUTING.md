@@ -117,8 +117,13 @@ leftovers; that grep is the check. See [docs/gqlgen-contract.md](docs/gqlgen-con
 These are out, and saying so is not a judgement on the idea: auth, pagination, filtering,
 dataloaders, subscriptions, file upload, migrations, a scaffolding CLI.
 
-Subscriptions in particular are blocked by architecture rather than effort — `adaptor.HTTPHandler`
-buffers the entire response, so a streaming transport cannot work through it. That one needs a
-Fiber-native handler, and a design discussion first.
+Subscriptions in particular were listed here as blocked by architecture, on the grounds that the
+adaptor buffers the entire response. That was measured in 0.3.0 and is false — the adaptor streams.
+Two other things stopped them, and only one is fixed: `Mount` used to register `transport.POST`
+before `Configure` ran, so a `Configure`-registered SSE transport could never be selected (fixed);
+and fasthttp does not cancel the request context when a client hangs up, so an abandoned stream has
+no upper bound once `RequestTimeout` is disabled — which a subscription requires. The second is
+upstream, and it is the real blocker. If you want to attempt this, that is the problem to solve
+first, and it needs a design discussion before code.
 
 If you want one of the others, open an issue describing the API you want before writing it.

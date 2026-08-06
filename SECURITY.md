@@ -130,15 +130,63 @@ queries, not a rate limiter, and it is narrower than it sounds:
 - The cost is **per selected field**. A list field costs the same whether it returns one row or ten
   million, so the limit does nothing about an unbounded `SELECT`. Bound your lists with
   `q.Limit(n)` — luima ships no pagination, so nothing else will.
-- There is **no depth limit anywhere in the stack**. In a schema with a cycle —
-  `User.friends: [User!]!` — 400 levels of nesting costs about 400 complexity, passes the limit,
-  and multiplies into a resolver call per node per level.
+- It does **not** bound nesting depth. In a schema with a cycle — `User.friends: [User!]!` — 400
+  levels of nesting costs about 400 complexity, passes the limit, and multiplies into a resolver
+  call per node per level. `MaxDepth` is the answer to that one, below.
 - Body-size and parse cost are separate again: the query text is fully parsed and validated before
-  the complexity extension sees an operation.
+  the complexity extension sees an operation. gqlgen sets **no** default token limit, so a large
+  document pays the full parse before anything rejects it. Measured on one such document: 53 ms
+  served, 36 ms to reject on complexity, 4 ms to reject on a token limit. Set one if you take
+  untrusted queries:
+
+  ```go
+  Configure: func(srv *handler.Server) { srv.SetParserTokenLimit(10000) },
+  ```
+
+  It is a `Configure` line rather than a `Config` field on purpose — the right number depends on
+  your largest legitimate query, and a wrong one rejects it.
 
 Tune `ComplexityLimit` for your schema, and put real rate limiting in the layer that does auth.
 
+**Nesting depth is capped at 15 by default.** Since 0.3.0. `Config.MaxDepth` rejects an operation
+nested deeper than the limit with `extensions.code: DEPTH_LIMIT_EXCEEDED`, the same way gqlgen's own
+complexity limit rejects. Zero means unset, negative disables it.
+
+The walk resolves fragment spreads. It has to: a spread node carries no selection set of its own, so
+a limiter that walks only the operation reads every named fragment as a leaf, and a 40-deep document
+hidden behind `...F` measures 1 and executes. That is a two-line change to the attacking query, and
+it is the difference between a depth limit and the appearance of one. An inline fragment is a type
+condition, not a level, so `... on User { name }` costs nothing.
+
+15 is chosen against the deepest document a default install serves — the playground's own
+introspection query, which measures 13. If your schema legitimately nests deeper, raise it.
+
 ## Transport
+
+**Cross-site request forgery: the default is closed.** luima ships no CSRF field, and that is not an
+omission — it registers no transport that needs one. Measured against a default mount:
+
+```
+POST x-www-form-urlencoded : HTTP 400  "transport not supported"
+POST multipart/form-data   : HTTP 400  "transport not supported"
+POST text/plain            : HTTP 400  "transport not supported"
+POST no Content-Type       : HTTP 400  "transport not supported"
+GET  ?query=mutation{...}  : HTTP 406  "GET requests only allow query operations"
+```
+
+`transport.POST` requires `application/json`, which an HTML form cannot send, and a cross-site
+`fetch` with that content type triggers a preflight luima answers without an
+`Access-Control-Allow-Origin`. `transport.GET` refuses non-query operations.
+
+Adding `transport.MultipartForm` through `Configure` removes all of that, and a cross-site form then
+executes mutations with the caller's cookies. If you add it, add a required header with it —
+[gotcha #37](docs/gotchas.md#37-the-multipart-transport-is-a-csrf-hole) has the code.
+
+**Not every error is redacted, because not every error reaches the presenter.** A transport-level
+failure — a malformed JSON body, an unsupported content type — is written by gqlgen's transport
+before an executor exists, so `PresentError` never sees it and a malformed body is echoed back in
+the message. What is disclosed there is the caller's own bytes, not the server's, but do not treat
+"everything goes through `PresentError`" as a reason to skip sanitizing something.
 
 With `sslmode` absent from your connection URL, `pg.ParseURL` returns
 `&tls.Config{InsecureSkipVerify: true}` — TLS is on, but the certificate is **not verified**. Use

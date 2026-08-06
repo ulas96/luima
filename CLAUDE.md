@@ -91,5 +91,13 @@ Every other doc shows the zero `Config` as idiomatic — it is, for a library ca
 ## Out of scope, deliberately
 
 Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations, a scaffolding CLI.
-Subscriptions are blocked by architecture, not effort: `adaptor.HTTPHandler` buffers the whole
-response, so no streaming transport works through it.
+
+Subscriptions are not implemented, and the reason recorded here until 0.3.0 — that the adaptor
+buffers the whole response — is false. Measured: a `Flush`ing handler streams correctly through
+`adaptor.HTTPHandlerWithContext`, eight chunked frames 400 ms apart. What actually blocked them was
+`Mount` registering `transport.POST` before `Configure` ran, so a `Configure`-registered SSE
+transport was never selected — fixed in 0.3.0. What still blocks them is fasthttp: it does not
+cancel the request context when the client disconnects (see `withFiberContext`), so an abandoned
+stream has no upper bound once `RequestTimeout` is disabled — which a subscription requires. That
+one is upstream. `transport.Websocket` was not measured; fasthttp exposes no `http.Hijacker`, so it
+is likely still impossible, but this file does not claim that.

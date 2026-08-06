@@ -5,11 +5,12 @@
 The gqlgen server is an `http.Handler`. Fiber runs on fasthttp. The bridge is one line:
 
 ```go
-r.All(endpoint, adaptor.HTTPHandler(srv))
+r.All(endpoint, adaptor.HTTPHandlerWithContext(withFiberContext(srv)))
 ```
 
-`adaptor.HTTPHandler` wraps `fasthttpadaptor`, converting fasthttp's `RequestCtx` into an
-`*http.Request` **per request**.
+`adaptor.HTTPHandlerWithContext` wraps `fasthttpadaptor`, converting fasthttp's `RequestCtx` into
+an `*http.Request` **per request**. Never plain `HTTPHandler` on this route: that variant hands the
+resolver the raw `*fasthttp.RequestCtx`, which reports no deadline and never cancels.
 
 > **Be clear about what that buys.** Fiber here provides routing, middleware and its ecosystem —
 > **not** speed. gqlgen does exactly the work it always did, plus a conversion. Anyone telling you
@@ -39,12 +40,32 @@ the assertion proves the request reached gqlgen rather than being answered by Fi
 
 ## 2. Fiber's `ErrorHandler` is unreachable — and must stay that way
 
-`adaptor.HTTPHandler` **always returns `nil`**. No resolver error can ever become a Fiber error, so
+The adaptor **always returns `nil`**. No resolver error can ever become a Fiber error, so
 `fiber.Config.ErrorHandler` will never see one.
 
-`PresentError` is therefore the *only* error contract. luima does not offer a second one through
-`Config.Fiber.ErrorHandler` and does not document one — a consumer who sets it and assumes their
-resolver errors flow through it has built a redaction layer that never runs.
+`PresentError` is therefore the only contract for errors a **resolver** returns. luima does not
+offer a second one through `Config.Fiber.ErrorHandler` and does not document one — a consumer who
+sets it and assumes their resolver errors flow through it has built a redaction layer that never
+runs.
+
+**It is not the only path to the wire, and that distinction matters.** Transport-level failures are
+written by gqlgen's transport *before* an executor exists, so they never reach the presenter and
+are not redacted. POST a malformed JSON body and the response is HTTP 400 with your own bytes
+reflected back:
+
+```
+{"errors":[{"message":"json request body could not be decoded: invalid character 'S' looking for
+ beginning of value body:{\"query\": SECRET-CANARY-abc"}],"data":null}
+```
+
+Same for `"transport not supported"`. Nothing of the *server's* is in that path — it is the
+caller's own body coming back to the caller — but do not decide you need not sanitize something on
+the strength of "everything goes through `PresentError`".
+
+The good news, measured alongside: errors gqlgen *does* hand to the presenter keep their codes.
+Parse (`GRAPHQL_PARSE_FAILED`), validation (`GRAPHQL_VALIDATION_FAILED`) and complexity
+(`COMPLEXITY_LIMIT_EXCEEDED`) rejections come out byte-identical to gqlgen's own
+`DefaultErrorPresenter` — the `*gqlerror.Error` pass-through branch carries them for free.
 
 ---
 
@@ -58,17 +79,42 @@ second thing `TestMountRoutes` pins. Route a catch-all explicitly if you want on
 
 ---
 
-## 4. `BodyLimit` and buffering — luima's documented ceiling
+## 4. `BodyLimit`, and why subscriptions are really out
 
-- **Fiber's default `BodyLimit` is 4 MB**, where `net/http` had none. Irrelevant to queries. It
-  becomes relevant the day someone adds the multipart transport for file uploads — and it will
-  present as a mysterious rejection, not a clear error. Raise it via `Config.Fiber.BodyLimit`.
-- **The adaptor buffers the entire response** before handing it to fasthttp. So a streaming
-  transport — SSE, or websocket subscriptions — **cannot work through `adaptor`**. It needs a
-  Fiber-native handler.
+**Fiber's default `BodyLimit` is 4 MB**, where `net/http` had none. Irrelevant to queries. It
+becomes relevant the day someone adds the multipart transport for file uploads — and it will
+present as a mysterious rejection, not a clear error. Raise it via `Config.Fiber.BodyLimit`.
 
-That second point is the honest reason subscriptions are out of scope: **architecture, not
-effort.** Adding `transport.Websocket` to the server would compile, mount, and never stream.
+> **Before you add that transport, read what it opens.** Adding `transport.MultipartForm` through
+> `Configure` also makes your endpoint reachable by a cross-site HTML form — `multipart/form-data`
+> is a "simple" request, so no preflight protects it, and a mutation submitted from any origin will
+> execute with the caller's cookies attached (measured). If you add it, require a header a form
+> cannot set — `Apollo-Require-Preflight`, or your own — in an `HTTPMiddleware`, and reject requests
+> without it. See [gotcha #37](gotchas.md#37-the-multipart-transport-is-a-csrf-hole).
+
+**Subscriptions are not implemented, and until 0.3.0 this section gave the wrong reason.** It said
+the adaptor buffers the entire response, so no streaming transport could work through it. That was
+measured and it is false — a `Flush`ing handler streams correctly through
+`adaptor.HTTPHandlerWithContext`, eight chunked frames arriving 400 ms apart, `content-length: -1`.
+It is false for plain `adaptor.HTTPHandler` too, so the change between the two is not what fixed it.
+
+Two things did block them:
+
+- **`Mount` registered `transport.POST` before `Configure` ran.** gqlgen selects the first transport
+  whose `Supports` matches, and `POST` matches `POST` + `application/json` without ever reading
+  `Accept` — a strict superset of what SSE matches. So a `Configure`-registered SSE transport was
+  unreachable by construction: it compiled, it mounted, it returned 200, and every subscription
+  silently answered with one buffered response. **Fixed in 0.3.0** — the transports now register
+  after `Configure`.
+- **fasthttp does not cancel the request context when the client hangs up.** Measured: the client
+  closed the connection after three frames and the resolver was still producing twenty frames later,
+  with `ctx.Err() == nil`. For a query that is survivable, because `RequestTimeout` bounds it at
+  15s. For a subscription it is not — a subscription has to disable `RequestTimeout` to live longer
+  than 15s, and disabling it removes the only bound there is, so an abandoned subscription holds a
+  goroutine and its database work forever. **This one is upstream**, and it is the real blocker.
+
+`transport.Websocket` was not measured. fasthttp exposes no `http.Hijacker`, so it is very likely
+still impossible, but this document does not claim that.
 
 ---
 
@@ -79,7 +125,7 @@ srv := handler.New(cfg.Schema)
 ```
 
 Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it gives no way to set an error
-presenter, which makes the [error contract](../README.md#errors) impossible.
+presenter, which makes the [error contract](../README.md#error-handling) impossible.
 
 ```go
 srv.AddTransport(transport.Options{})  // answers the OPTIONS preflight

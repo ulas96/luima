@@ -161,12 +161,21 @@ type Config struct {
 	// Fiber @notice Passed through to fiber.New. Ignored by Mount.
 	//
 	// @dev Fiber's BodyLimit defaults to 4 MB where net/http had none — irrelevant to
-	// queries, and the thing to raise here the day you add the multipart transport.
+	// queries, and the thing to raise here the day you add the multipart transport. Read the
+	// CSRF cost before you add that transport: multipart/form-data is a "simple" request, so no
+	// preflight protects it and a cross-site HTML form can execute a mutation with the caller's
+	// cookies attached (measured — gotcha #37).
 	//
 	// Setting Fiber.ErrorHandler does nothing useful for resolver errors: the adaptor always
 	// returns nil, and so does the timeout middleware on both its normal and its timed-out
-	// path, so no resolver error ever becomes a Fiber error. ErrorPresenter is the only error
-	// contract there is.
+	// path, so no resolver error ever becomes a Fiber error.
+	//
+	// ErrorPresenter is the only contract for errors a *resolver* returns. Transport-level
+	// failures — a malformed JSON body, an unsupported content type — are written by gqlgen's
+	// transport before any executor exists, so they never reach the presenter and are not
+	// redacted; a malformed body is echoed back in the message. Nothing sensitive of the
+	// server's is in that path, but the claim that everything goes through the presenter is
+	// not one to build on.
 	Fiber fiber.Config
 }
 

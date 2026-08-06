@@ -24,8 +24,10 @@ your application and you want one implementation of their integration and error-
 Luima does not generate your GraphQL schema or resolvers. You own `gqlgen.yml`,
 `schema.graphqls`, `graph/resolver.go`, and every `gqlgen generate` run. Luima also does not
 provide authentication, authorization, CORS policy, schema-level pagination or filtering APIs,
-dataloaders, file uploads, migrations, or scaffolding. Subscriptions are unsupported because the
-Fiber adaptor buffers responses instead of streaming them.
+dataloaders, file uploads, migrations, or scaffolding. Subscriptions are unsupported: fasthttp does
+not cancel the request context when a client disconnects, so an abandoned stream has no upper bound
+once `RequestTimeout` is disabled — which a subscription requires. See
+[docs/fiber.md](docs/fiber.md#4-bodylimit-and-why-subscriptions-are-really-out).
 
 > **Security:** Luima does not identify callers or restrict which rows they can access. Add
 > authentication middleware before mounting GraphQL and add ownership predicates to database
@@ -287,7 +289,8 @@ func (r *mutationResolver) DeleteUser(ctx context.Context, personalID string) (b
 
 `Get`, `Update`, and `Delete` apply modifiers after `WherePK`. A row that does not match the
 ownership predicate is reported as absent. Pass untrusted data as `?` parameters; do not use it to
-construct SQL fragments or identifiers.
+construct SQL fragments or identifiers. This is the mechanism that stops the helpers being an IDOR
+by construction — see [SECURITY.md](SECURITY.md).
 
 ## API
 
@@ -327,6 +330,7 @@ to an existing app or route group and ignores `Config.Fiber`.
 | `RequestTimeout` | `15s` | Resolver deadline; a negative value disables it |
 | `QueryCache` | `1000` | Parsed-query cache entries; a negative value disables the cache |
 | `ComplexityLimit` | `1000` | Operation complexity limit; a negative value disables it and it does not limit returned rows |
+| `MaxDepth` | `15` | Operation nesting depth limit; a negative value disables it. Complexity does not bound depth |
 | `ErrorPresenter` | `luima.PresentError` | Controls which error message reaches the client |
 | `HTTPMiddleware` | `nil` | `[]func(http.Handler) http.Handler`; the first item is outermost |
 | `Configure` | `nil` | `func(*handler.Server)`; runs after Luima configures gqlgen and before mounting |
@@ -346,7 +350,7 @@ response body.
 ```go
 func Get[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (*T, error)
 func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Query) ([]*T, error)
-func Create[T any](ctx context.Context, db orm.DB, model *T, label string) (*T, error)
+func Create[T any](ctx context.Context, db orm.DB, model *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error)
 func Update[T any](ctx context.Context, db orm.DB, model *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error)
 func Delete[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (bool, error)
 ```
@@ -355,7 +359,7 @@ func Delete[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Que
 |---|---|
 | `Get` | Selects by primary key; returns `(nil, nil)` when no row matches |
 | `List` | On success, returns a non-nil slice; modifiers supply filtering, ordering, and limits |
-| `Create` | Inserts with `RETURNING *`; SQLSTATE `23505` becomes `label + " already exists"` |
+| `Create` | Inserts with `RETURNING *`; SQLSTATE `23505` becomes `label + " already exists"`; an insert the database suppressed returns `(nil, nil)` |
 | `Update` | Updates by primary key with `RETURNING *`; no match becomes `label + " not found"` |
 | `Delete` | Deletes by primary key; returns `false` when no row matches |
 
@@ -378,6 +382,7 @@ updated, err := luima.Update(ctx, db, user, "user "+user.PersonalID,
 type CustomError struct {
     UserMessage   string
     InternalError error
+    Code          string
 }
 
 func PresentError(ctx context.Context, err error) *gqlerror.Error
@@ -392,6 +397,22 @@ func SQLState(err error) string
 
 Treat `CustomError.UserMessage` as public data. Do not populate it with `err.Error()` or another
 database-derived string. `InternalError` remains available through `errors.Is` and `errors.As`.
+
+`Code` becomes `extensions.code` on the wire, and is what clients should branch on — the message is
+built from caller-supplied text and is not a stable contract. An empty `Code` emits no extensions
+object.
+
+| Code | Sent by |
+|---|---|
+| `CONFLICT` | `Create`, on SQLSTATE `23505` |
+| `NOT_FOUND` | `Update`, when no row matched |
+| `INTERNAL_SERVER_ERROR` | Every redacted error |
+| `DEPTH_LIMIT_EXCEEDED` | `MaxDepth` |
+| `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`, `COMPLEXITY_LIMIT_EXCEEDED` | gqlgen, passed through unchanged |
+
+Transport-level failures — a malformed body, an unsupported content type — are written by gqlgen's
+transport before an executor exists. They never reach `PresentError`, carry no code, and are not
+redacted.
 
 `SQLState` returns a PostgreSQL SQLSTATE from a wrapped go-pg error or an empty string when the
 chain contains no `pg.Error`. Common integrity codes are `23505` for a unique violation, `23503`

@@ -10,18 +10,18 @@ below expand the ones that need more than a row.
 |---|---|---|---|
 | 1 | Server panics at runtime; `go build` was clean | gqlgen writes a compiling `panic("not implemented")` stub for every unimplemented schema field | `grep -rn 'not implemented' graph/*.resolvers.go` after every generate ([contract](gqlgen-contract.md#go-build-is-not-the-schema-check)) |
 | 2 | Browser clients fail; nothing in the server log | Registered with `r.Post`; the `OPTIONS` preflight 405s before reaching gqlgen | `r.All(endpoint, …)` — luima does this ([fiber](fiber.md#1-all-never-post)) |
-| 3 | `fiber.Config.ErrorHandler` never fires | `adaptor.HTTPHandler` always returns `nil` | Use the error presenter; there is no second contract ([fiber](fiber.md#2-fibers-errorhandler-is-unreachable--and-must-stay-that-way)) |
+| 3 | `fiber.Config.ErrorHandler` never fires | The adaptor always returns `nil`, so no resolver error becomes a Fiber error | Use the error presenter; there is no second contract for *resolver* errors ([fiber](fiber.md#2-fibers-errorhandler-is-unreachable--and-must-stay-that-way)) |
 | 4 | Unknown paths 404 instead of showing the playground | Fiber's `Get("/")` is exact, `net/http`'s was a prefix | Intended. Route a catch-all explicitly ([fiber](fiber.md#3-get-is-an-exact-match)) |
 | 5 | Every request is slow under load | `handler.New` defaults to `graphql.NoCache`; queries re-parse and re-validate | Leave `Config.QueryCache` at zero — zero means 1000, not off |
 | 6 | Playground's docs pane is empty | `handler.New` adds no extensions | luima always adds `extension.Introspection{}` |
-| 7 | File upload fails around 4 MB | Fiber's `BodyLimit` defaults to 4 MB; `net/http` had none | Raise `Config.Fiber.BodyLimit` |
-| 8 | Subscriptions/SSE never stream | `adaptor` buffers the whole response | Needs a Fiber-native handler; not supported in v1 |
+| 7 | File upload fails around 4 MB | Fiber's `BodyLimit` defaults to 4 MB; `net/http` had none | Raise `Config.Fiber.BodyLimit` — and read [#37](#37-the-multipart-transport-is-a-csrf-hole) before adding the transport |
+| 8 | Subscriptions/SSE never stream | Not the adaptor — it streams. `Mount` selected `transport.POST` first (fixed in 0.3.0), and fasthttp never cancels on client hangup | Not supported. The hangup half is upstream ([fiber](fiber.md#4-bodylimit-and-why-subscriptions-are-really-out)) |
 | 9 | `errors.As(err, &pgErr)` never matches | `pg.Error` is an **interface**, not pgx's `*pgconn.PgError` | `var pgErr pg.Error`, or just `luimaerr.SQLState(err)` |
 | 10 | Update of a missing row succeeds silently | A plain `UPDATE` does not return `pg.ErrNoRows` | Check `RowsAffected() == 0` **and** `pg.ErrNoRows` ([below](#10-the-two-absence-signals)) |
 | 11 | A missing row is a 500 instead of `null` | A single-row `Select()` returns `pg.ErrNoRows` | `crud.Get` translates it to `(nil, nil)` |
 | 12 | Insert fails: Postgres rejects JSON for a `text[]` | Missing `,array`; go-pg falls back to `pgTypeJSONB` | `pg:"projects,array"` |
 | 13 | An empty list cannot clear an array column | `UpdateNotZero` skips zero values | `Update` — luima never calls `UpdateNotZero` |
-| 14 | Mutations answer with the value sent, not stored | No `RETURNING`; defaults, triggers and generated columns never seen | `Returning("*")` — luima does this ([below](#14-returning-)) |
+| 14 | Mutations answer with the value sent, not stored | No `RETURNING`; defaults, triggers and generated columns never seen | `Returning("*")` — luima does this ([below](#14-returning)) |
 | 15 | Empty list marshals as `null`, breaking `[T!]!` | A nil slice is not an empty slice | `crud.List` seeds `[]*T{}` |
 | 16 | A resolver's clear error message reads as "internal server error" | Returned a bare `error`; the presenter redacts it | Wrap in `*CustomError`, or use the crud helpers ([below](#16-resolvers-opt-in-to-being-heard)) |
 | 17 | *Every* schema typo reads as "internal server error" | Dropped the `*gqlerror.Error` branch from the presenter | Keep all three branches |
@@ -37,13 +37,14 @@ below expand the ones that need more than a row.
 | 27 | A column your mapper forgot is `NULL` after every update | `Update` is a full replace, and go-pg writes `NULL` — not `""` — for a zero-valued field | Name the columns: `q.Column("name", "email")` ([below](#27-update-writes-every-column-as-null)) |
 | 28 | Every column is client-writable | `autobind` bound your DB model as the GraphQL `input` | Separate `input` type; never name one after a model struct ([below](#28-autobind-mass-assignment)) |
 | 29 | Anyone can read or delete anyone's row | `WherePK()` alone; no ownership predicate | Pass one: `q.Where("owner_id = ?", …)` ([security](../SECURITY.md#getting-the-callers-identity-into-a-resolver)) |
-| 30 | Your signup mutation confirms which emails are registered | `Create`'s `label` reaches the client on a unique violation | Constant label for enumeration-sensitive tables ([below](#30-create-s-label-is-an-existence-oracle)) |
+| 30 | Your signup mutation confirms which emails are registered | `Create`'s `label` reaches the client on a unique violation | Constant label for enumeration-sensitive tables ([below](#30-creates-label-is-an-existence-oracle)) |
 | 31 | SQL injection through a "safe" ORM | `OrderExpr`/`ColumnExpr`/`Having` interpolate raw SQL by design | Allowlist client-supplied identifiers ([below](#31-the-injection-surface-is-the-options-closure)) |
 | 32 | Check-then-write races under load | Each helper is one autocommitted statement | `db.RunInTransaction` + `q.For("UPDATE")` |
 | 33 | A DSN that lost its credentials connects anyway | go-pg falls back to `$PGUSER`/`$PGPASSWORD`, then literal `postgres` | Set `application_name` and check `pg_stat_activity` |
 | 34 | The client IP is the proxy's, even with `TrustProxy: true` | `TrustProxy` changes `fiber.Ctx` accessors; resolvers hold the adaptor's `*http.Request`, which it never touches | Parse `X-Forwarded-For` in `HTTPMiddleware` ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
 | 35 | `Secure` cookies are dropped, or a redirect loop, behind a TLS proxy | `r.TLS` is `nil` — the hop into the process really is plaintext | Gate on `X-Forwarded-Proto`, never on `r.TLS` ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
 | 36 | The playground loads through the proxy, then every query 404s | Its fetch URL embeds `Endpoint` verbatim, and the proxy stripped the path prefix | Pass the prefix through, or set `Endpoint` to the externally visible path ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
+| 37 | A cross-site HTML form executes a mutation on your server | You added `transport.MultipartForm`; `multipart/form-data` is a "simple" request, so no preflight protects it | Require a header a form cannot set, in `HTTPMiddleware` ([below](#37-the-multipart-transport-is-a-csrf-hole)) |
 
 ---
 
@@ -74,6 +75,18 @@ if res.RowsAffected() == 0 { … }            // the plain path
 
 `orm.Result` is `Model()`, `RowsAffected() int` (−1 when the query cannot affect rows) and
 `RowsReturned() int`.
+
+**`Create` has the same two signals, and that surprises people** — an INSERT looks like it always
+inserts. It does not: `ON CONFLICT DO NOTHING` suppresses one, and so does a `BEFORE INSERT` trigger
+returning `NULL`, which needs no cooperation from the caller at all. With `RETURNING *` that arrives
+as `pg.ErrNoRows` too. Before 0.3.0 `crud.Create` returned it bare and the presenter redacted it, so
+a soft-ignore trigger made every suppressed insert answer `"internal server error"`. It now returns
+`(nil, nil)`, like `Get`. **Check the result** — a caller assuming non-nil nil-dereferences the
+second time the same key is inserted.
+
+And note the ordering trap if you write this yourself: `res` is `nil` whenever `err` is non-nil, so
+the `RowsAffected()` check has to come *after* the error branch returns. Copying the shape above
+without noticing writes a panic.
 
 ---
 
@@ -242,6 +255,64 @@ return q.Order(col)
 ```
 
 This belongs in luima's docs precisely *because* the design pushes the code onto you.
+
+---
+
+## #37 The multipart transport is a CSRF hole
+
+**A default luima mount is closed.** Measured against one, every shape a cross-site HTML form can
+send is refused before it reaches an executor:
+
+```
+POST x-www-form-urlencoded : HTTP 400  "transport not supported"
+POST multipart/form-data   : HTTP 400  "transport not supported"
+POST text/plain            : HTTP 400  "transport not supported"
+POST no Content-Type       : HTTP 400  "transport not supported"
+GET  ?query=mutation{...}  : HTTP 406  "GET requests only allow query operations"
+```
+
+That is not luck. `transport.POST` requires `application/json`, which an HTML form cannot send, and
+a cross-site `fetch` with that content type triggers a preflight luima answers without an
+`Access-Control-Allow-Origin`. `transport.GET` refuses non-query operations outright. This is why
+luima ships no CSRF field: it registers no transport that needs one.
+
+**Adding the multipart transport removes all of it, in one line.** `Configure` makes that one line
+easy:
+
+```
+=== Configure CAN add MultipartForm: a cross-site HTML form now reaches a MUTATION ===
+  multipart mutation  : HTTP 200  {"data":{"ping":"pong"}}
+  resolver saw RawQuery : "mutation{drop}"
+```
+
+A plain `<form enctype="multipart/form-data">` on any site, auto-submitted, executing a mutation on
+your server with the victim's cookies attached. No preflight, because multipart is a *simple*
+request. This is precisely the hole Apollo's `csrfPrevention` exists to close, and it is silent —
+you get a 200 and a successful mutation.
+
+**If you add the transport, add the check with it.** Require a header a form cannot set —
+`Apollo-Require-Preflight`, or your own — and reject requests without it:
+
+```go
+luima.Config{
+    Configure: func(srv *handler.Server) { srv.AddTransport(transport.MultipartForm{}) },
+    HTTPMiddleware: []func(http.Handler) http.Handler{
+        func(next http.Handler) http.Handler {
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if r.Header.Get("Apollo-Require-Preflight") == "" {
+                    http.Error(w, "preflight required", http.StatusForbidden)
+                    return
+                }
+                next.ServeHTTP(w, r)
+            })
+        },
+    },
+}
+```
+
+`transport.UrlEncodedForm` is measurably less dangerous — it reached an anonymous query (`{ping}` →
+200) while every mutation shape tried came back 422 at parse. Do not rely on that. It is a parsing
+accident, not a guarantee.
 
 ---
 

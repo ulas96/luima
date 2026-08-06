@@ -36,8 +36,8 @@ func ExampleNew() {
 // ExampleNew_production @notice Production settings: no playground, a raised body limit, and
 // timeouts.
 //
-// @dev Anything in Fiber is passed through untouched — except ErrorHandler, which
-// adaptor.HTTPHandler makes unreachable.
+// @dev Anything in Fiber is passed through untouched — except ErrorHandler, which the adaptor
+// makes unreachable by always returning nil.
 func ExampleNew_production() {
 	app := luima.New(luima.Config{
 		Schema:               newStubSchema(),
