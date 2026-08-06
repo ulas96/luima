@@ -42,6 +42,39 @@ func TestPresentError(t *testing.T) {
 	}
 }
 
+// TestPresentErrorCode @notice Pins what reaches extensions.code on each branch.
+//
+// @dev A client is supposed to branch on the code rather than on the message, and crud.Create
+// builds its message from caller-supplied text — so the code is the only part of a luima error
+// response that is a contract. Three properties, and the third is the compatibility one: a
+// CustomError with no Code must put nothing on the wire, or every client written against 0.2.1
+// starts seeing an extensions object it did not have before.
+//
+// @param t the test handle
+func TestPresentErrorCode(t *testing.T) {
+	ctx := context.Background()
+
+	coded := luimaerr.PresentError(ctx, &luimaerr.CustomError{UserMessage: "user X already exists", Code: "CONFLICT"})
+	if got := coded.Extensions["code"]; got != "CONFLICT" {
+		t.Errorf("extensions.code = %v, want CONFLICT", got)
+	}
+
+	redacted := luimaerr.PresentError(ctx, errors.New("constraint app_users_pkey"))
+	if got := redacted.Extensions["code"]; got != "INTERNAL_SERVER_ERROR" {
+		t.Errorf("redacted extensions.code = %v, want INTERNAL_SERVER_ERROR", got)
+	}
+	if redacted.Message != "internal server error" {
+		t.Errorf("the code changed the message to %q", redacted.Message)
+	}
+
+	// The zero CustomError is what 0.2.1 callers already construct, and it must stay
+	// byte-identical on the wire.
+	bare := luimaerr.PresentError(ctx, &luimaerr.CustomError{UserMessage: "nope"})
+	if bare.Extensions != nil {
+		t.Errorf("a CustomError with no Code emitted extensions %v", bare.Extensions)
+	}
+}
+
 // TestCustomErrorUnwrap @notice Asserts the cause stays reachable through errors.Is/As.
 //
 // @dev This is what makes SQLState work on a CustomError, and it is the whole reason

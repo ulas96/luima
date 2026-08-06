@@ -133,8 +133,8 @@ func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Q
 // @param opts   query modifiers applied left to right, after Returning("*")
 // @return *T    the stored row with defaults, triggers and generated columns applied, or nil if
 // the insert was suppressed
-// @return error a *luimaerr.CustomError on 23505, nil on a suppressed insert, the bare driver
-// error otherwise
+// @return error a *luimaerr.CustomError with Code "CONFLICT" on 23505, nil on a suppressed
+// insert, the bare driver error otherwise
 func Create[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
 	q := db.ModelContext(ctx, m).Returning("*")
 	for _, opt := range opts {
@@ -144,7 +144,7 @@ func Create[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...f
 	res, err := q.Insert()
 	if err != nil {
 		if luimaerr.SQLState(err) == "23505" { // unique_violation
-			return nil, &luimaerr.CustomError{UserMessage: label + " already exists", InternalError: err}
+			return nil, &luimaerr.CustomError{UserMessage: label + " already exists", InternalError: err, Code: "CONFLICT"}
 		}
 		// Absence has the same two spellings here as in Update, for the same reason. With
 		// RETURNING *, go-pg is scanning a result set, so an insert that produced no row comes
@@ -203,7 +203,8 @@ func Create[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...f
 // @param label  names the thing in the not-found message
 // @param opts   query modifiers applied left to right, after WherePK
 // @return *T    the stored row
-// @return error a *luimaerr.CustomError when no row matched, the bare driver error otherwise
+// @return error a *luimaerr.CustomError with Code "NOT_FOUND" when no row matched, the bare
+// driver error otherwise
 func Update[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
 	q := db.ModelContext(ctx, m).WherePK().Returning("*")
 	for _, opt := range opts {
@@ -212,12 +213,12 @@ func Update[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...f
 	res, err := q.Update()
 	if err != nil {
 		if errors.Is(err, pg.ErrNoRows) {
-			return nil, &luimaerr.CustomError{UserMessage: label + " not found"}
+			return nil, &luimaerr.CustomError{UserMessage: label + " not found", Code: "NOT_FOUND"}
 		}
 		return nil, err
 	}
 	if res.RowsAffected() == 0 {
-		return nil, &luimaerr.CustomError{UserMessage: label + " not found"}
+		return nil, &luimaerr.CustomError{UserMessage: label + " not found", Code: "NOT_FOUND"}
 	}
 	return m, nil
 }

@@ -41,6 +41,16 @@ type CustomError struct {
 	// underlying pg.Error stays reachable, which is what makes SQLState work on a wrapped
 	// error.
 	InternalError error
+
+	// Code @notice A machine-readable code for the client, e.g. "CONFLICT". Optional.
+	//
+	// @dev Clients should branch on this, never on UserMessage — the message is built from
+	// caller-supplied text (see crud.Create's label) and is not a stable contract. Empty means
+	// no extensions object is emitted, so a zero CustomError is unchanged on the wire.
+	//
+	// Nothing here is auth-shaped on purpose. CONFLICT and NOT_FOUND describe rows; a library
+	// that ships no auth has no business defining UNAUTHENTICATED.
+	Code string
 }
 
 // Error @notice Renders the message and, when there is one, the cause.
@@ -72,13 +82,28 @@ func (e *CustomError) Unwrap() error { return e.InternalError }
 // the client sees "internal server error". That is the design, and it is most of why the CRUD
 // helpers in the crud package exist — they do the classification so a resolver cannot forget it.
 //
+// It is not, however, the only path to the wire. A transport-level failure — a malformed JSON body,
+// an unsupported content type — is written by gqlgen's transport before an executor exists, so it
+// never reaches this function and is not redacted. See the note on Config.Fiber in the server
+// package. Errors gqlgen generates and hands here keep their own extensions.code
+// (GRAPHQL_PARSE_FAILED, GRAPHQL_VALIDATION_FAILED, COMPLEXITY_LIMIT_EXCEEDED) through the
+// pass-through branch below.
+//
 // @param ctx  the resolver context, read only for graphql.GetPath
 // @param err  the error a resolver returned
 // @return *gqlerror.Error the message the client receives, with the field path attached
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	var ce *CustomError
 	if errors.As(err, &ce) {
-		return &gqlerror.Error{Message: ce.UserMessage, Path: graphql.GetPath(ctx)}
+		out := &gqlerror.Error{Message: ce.UserMessage, Path: graphql.GetPath(ctx)}
+		// Only when set, so a zero CustomError is byte-identical on the wire to what 0.2.1
+		// sent. An empty code would be worse than none: a client branching on
+		// extensions.code == "" has no way to tell "this server does not send codes" from
+		// "this error has no code".
+		if ce.Code != "" {
+			out.Extensions = map[string]any{"code": ce.Code}
+		}
+		return out
 	}
 	// Parse and validation errors are gqlgen's own text about the query the client just sent,
 	// so they disclose nothing about the server. They pass through unchanged — without this,
@@ -116,7 +141,13 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	// it is what makes an incident debuggable, and it means your log store inherits the
 	// database's confidentiality requirements. See SECURITY.md.
 	log.Printf("resolver error: %q", err)
-	return gqlerror.WrapPath(graphql.GetPath(ctx), errors.New("internal server error"))
+	redacted := gqlerror.WrapPath(graphql.GetPath(ctx), errors.New("internal server error"))
+	// Unconditional here, unlike the CustomError branch: this is the one error whose class the
+	// client can be told for free. The message says nothing, so the code says nothing either —
+	// it just spares every Apollo-shaped client a string comparison against "internal server
+	// error", which is the string this function most wants freedom to change.
+	redacted.Extensions = map[string]any{"code": "INTERNAL_SERVER_ERROR"}
+	return redacted
 }
 
 // SQLState @notice Returns the Postgres SQLSTATE of err, or "" if err is not a driver error.
