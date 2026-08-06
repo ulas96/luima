@@ -133,10 +133,13 @@ func List[T any](ctx context.Context, d orm.DB, opts ...func(*orm.Query) *orm.Qu
 // @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param m      the model to insert
 // @param label  names the thing in the conflict message
-// @return *T    the stored row, with RETURNING * applied. See [crud.Create].
-// @return error a *CustomError on 23505, the bare driver error otherwise
-func Create[T any](ctx context.Context, d orm.DB, m *T, label string) (*T, error) {
-	return crud.Create[T](ctx, d, m, label)
+// @param opts   query modifiers, e.g. q.OnConflict("DO NOTHING")
+// @return *T    the stored row with RETURNING * applied, or nil if the insert was suppressed.
+// See [crud.Create].
+// @return error a *CustomError on 23505, nil on a suppressed insert, the bare driver error
+// otherwise
+func Create[T any](ctx context.Context, d orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	return crud.Create[T](ctx, d, m, label, opts...)
 }
 
 // Update @notice Replaces every column of the row with m's primary key.

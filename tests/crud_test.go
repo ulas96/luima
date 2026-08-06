@@ -190,6 +190,110 @@ func TestCRUD(t *testing.T) {
 
 	t.Run("ownership predicate", func(t *testing.T) { testOwnership(ctx, t, conn) })
 	t.Run("partial update", func(t *testing.T) { testPartialUpdate(ctx, t, conn) })
+	t.Run("suppressed conflict", func(t *testing.T) { testSuppressedConflict(ctx, t, conn) })
+	t.Run("swallowed by trigger", func(t *testing.T) { testSwallowedByTrigger(ctx, t, conn) })
+}
+
+// testSuppressedConflict @notice Asserts an insert the caller asked Postgres to skip comes back as
+// absence, not as an error.
+//
+// @dev ON CONFLICT DO NOTHING is the reason Create needed the variadic at all — it is the only way
+// to attempt an insert inside a transaction without risking the whole thing, because a suppressed
+// conflict does not abort the transaction where a real 23505 does.
+//
+// The trap it opens: Create issues RETURNING *, so go-pg is scanning a result set, and a suppressed
+// insert produces no row. That arrives as pg.ErrNoRows, not as a row count. Returned bare it is a
+// redacted "internal server error" for a mutation that did exactly what the caller asked.
+//
+// @param ctx  the query context
+// @param t    the test handle
+// @param conn the live pool
+func testSuppressedConflict(ctx context.Context, t *testing.T, conn *pg.DB) {
+	t.Helper()
+
+	ignoreConflict := func(q *orm.Query) *orm.Query { return q.OnConflict("DO NOTHING") }
+	const id = "conflict-1"
+	t.Cleanup(func() {
+		if _, err := crud.Delete(ctx, conn, &testUser{PersonalID: id}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	first, err := crud.Create(ctx, conn, &testUser{PersonalID: id, Name: "first"}, "user "+id, ignoreConflict)
+	if err != nil || first == nil {
+		t.Fatalf("first Create = %+v, %v — want the stored row", first, err)
+	}
+
+	second, err := crud.Create(ctx, conn, &testUser{PersonalID: id, Name: "second"}, "user "+id, ignoreConflict)
+	if err != nil {
+		t.Errorf("suppressed Create = %v, want nil — the insert was skipped, not broken", err)
+	}
+	if second != nil {
+		t.Errorf("suppressed Create returned %+v, want nil", second)
+	}
+
+	// The first row is still the one in the table: DO NOTHING means nothing, not an upsert.
+	stored, err := crud.Get(ctx, conn, &testUser{PersonalID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.Name != "first" {
+		t.Errorf("stored row = %+v, want the first insert untouched", stored)
+	}
+}
+
+// testSwallowedByTrigger @notice The same absence, reached with no options at all.
+//
+// @dev This is the one that makes 0.3.0 a bug fix rather than a feature. The caller is not the only
+// thing that can suppress an insert: a BEFORE INSERT trigger returning NULL does it too, and that is
+// the ordinary way to write a soft-ignore or an audit filter. Against 0.2.1 this call returns
+// pg.ErrNoRows bare and the client is told the server is broken.
+//
+// The trigger is conditional on the id prefix and dropped on the way out, so the surrounding script
+// and the other subtests never see it.
+//
+// @param ctx  the query context
+// @param t    the test handle
+// @param conn the live pool
+func testSwallowedByTrigger(ctx context.Context, t *testing.T, conn *pg.DB) {
+	t.Helper()
+
+	if _, err := conn.Exec(`create or replace function luima_test_swallow() returns trigger as $$
+		begin
+			if new.personal_id like 'swallow-%' then return null; end if;
+			return new;
+		end;
+	$$ language plpgsql`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(`create or replace trigger luima_test_swallow_trg
+		before insert on luima_test_users
+		for each row execute function luima_test_swallow()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := conn.Exec("drop trigger if exists luima_test_swallow_trg on luima_test_users"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := conn.Exec("drop function if exists luima_test_swallow()"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	got, err := crud.Create(ctx, conn, &testUser{PersonalID: "swallow-1", Name: "gone"}, "user swallow-1")
+	if err != nil {
+		t.Errorf("Create = %v, want nil — the trigger swallowed the row deliberately", err)
+	}
+	if got != nil {
+		t.Errorf("Create returned %+v, want nil", got)
+	}
+	if errors.Is(err, pg.ErrNoRows) {
+		t.Error("Create leaked pg.ErrNoRows, which PresentError redacts to \"internal server error\"")
+	}
+
+	if stored, err := crud.Get(ctx, conn, &testUser{PersonalID: "swallow-1"}); err != nil || stored != nil {
+		t.Errorf("row %+v reached the table, so the trigger did not fire: %v", stored, err)
+	}
 }
 
 // testOwnership @notice Asserts the opts variadic actually scopes Get, Update and Delete.

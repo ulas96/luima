@@ -48,14 +48,16 @@ var (
 // The shapes the CRUD five instantiate to. Declared as aliases so the assertions above read as one
 // type per line.
 //
-// All but Create take the query-modifier variadic: Get, Update and Delete need it so an ownership
-// predicate is expressible at all, and List has always had it. Create is the exception because an
-// INSERT has no WHERE clause to scope.
+// All five take the query-modifier variadic. Get, Update and Delete need it so an ownership
+// predicate is expressible at all, and List has always had it. Create was the exception, on the
+// reasoning that an INSERT has no WHERE clause to scope — sound as far as it went, and wrong: the
+// clause it needs is ON CONFLICT, which is the only way to attempt an insert inside a transaction
+// without a real 23505 aborting the whole thing.
 type (
 	opt      = func(*orm.Query) *orm.Query
 	getFn    = func(context.Context, orm.DB, *row, ...opt) (*row, error)
 	listFn   = func(context.Context, orm.DB, ...opt) ([]*row, error)
-	createFn = func(context.Context, orm.DB, *row, string) (*row, error)
+	createFn = func(context.Context, orm.DB, *row, string, ...opt) (*row, error)
 	updateFn = func(context.Context, orm.DB, *row, string, ...opt) (*row, error)
 	delFn    = func(context.Context, orm.DB, *row, ...opt) (bool, error)
 )

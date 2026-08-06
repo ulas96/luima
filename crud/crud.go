@@ -100,6 +100,8 @@ func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Q
 // @dev A unique violation (23505) becomes a *CustomError, which is what makes it reach the
 // client at all; every other driver error is returned bare and PresentError redacts it.
 //
+// Absence is the exception, and it is the one this used to get wrong — see below.
+//
 // RETURNING * is deliberate, and is the one place this differs from the server it was lifted
 // from. That server could skip it after auditing its single table for defaults, triggers and
 // generated columns. luima serves tables it has never seen: without RETURNING, a table with a
@@ -107,19 +109,59 @@ func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Q
 // answer with the value the client *sent* rather than the value Postgres *stored* — silently,
 // forever, with a passing test suite. It is the same statement and the same round trip.
 //
+// An insert the database declined to perform is absence, not an error: (nil, nil), the same
+// convention as [Get]. Two things reach it. q.OnConflict("DO NOTHING") is the one the caller asks
+// for — and the reason the opts exist here at all, since a suppressed conflict does not abort the
+// surrounding transaction where a real 23505 does, making it the only way to attempt an insert
+// inside one without risking the whole thing. A BEFORE INSERT trigger returning NULL is the one the
+// caller does not: it is the ordinary way to write a soft-ignore, and it needs no options.
+//
+// Check the result. A caller who assumes non-nil nil-dereferences the second time the same key is
+// inserted:
+//
+//	u, err := luima.Create(ctx, db, user, "user "+id, func(q *orm.Query) *orm.Query {
+//	    return q.OnConflict("DO NOTHING")
+//	})
+//	if err != nil { return nil, err }
+//	if u == nil { /* it was already there */ }
+//
 // @param ctx    the resolver context
 // @param db     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
 // @param m      the model to insert; it is overwritten with the stored row and returned
 // @param label  names the thing in the conflict message — Create(ctx, db, u, "user "+id)
 // yields "user E-1042 already exists"
-// @return *T    the stored row, with defaults, triggers and generated columns applied
-// @return error a *luimaerr.CustomError on 23505, the bare driver error otherwise
-func Create[T any](ctx context.Context, db orm.DB, m *T, label string) (*T, error) {
-	if _, err := db.ModelContext(ctx, m).Returning("*").Insert(); err != nil {
+// @param opts   query modifiers applied left to right, after Returning("*")
+// @return *T    the stored row with defaults, triggers and generated columns applied, or nil if
+// the insert was suppressed
+// @return error a *luimaerr.CustomError on 23505, nil on a suppressed insert, the bare driver
+// error otherwise
+func Create[T any](ctx context.Context, db orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+	q := db.ModelContext(ctx, m).Returning("*")
+	for _, opt := range opts {
+		q = opt(q)
+	}
+
+	res, err := q.Insert()
+	if err != nil {
 		if luimaerr.SQLState(err) == "23505" { // unique_violation
 			return nil, &luimaerr.CustomError{UserMessage: label + " already exists", InternalError: err}
 		}
+		// Absence has the same two spellings here as in Update, for the same reason. With
+		// RETURNING *, go-pg is scanning a result set, so an insert that produced no row comes
+		// back as pg.ErrNoRows. Returned bare — which is what 0.2.1 did — PresentError redacts
+		// it, and a mutation that did exactly what it was told reads as a broken server.
+		if errors.Is(err, pg.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
+	}
+
+	// After the early return, never before it: res is nil whenever err is non-nil, so this check
+	// written above the block is a nil dereference rather than a bug. It is the other spelling —
+	// an option that drops the RETURNING clause makes a suppressed insert succeed at zero rows
+	// instead of erroring.
+	if res.RowsAffected() == 0 {
+		return nil, nil
 	}
 	return m, nil
 }
