@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/limiter"
 
@@ -60,6 +63,40 @@ func main() {
 		}),
 		DisablePlayground:    !dev,
 		DisableIntrospection: !dev,
+
+		// HTTPMiddleware is the seam for anything that needs the real *http.Request. This one is
+		// the smallest useful example: a request id put into the resolver context, which is what
+		// makes a resolver's log line joinable to the access log. Anything reading a header —
+		// a trace parent, a tenant, an Authorization header — has the same shape.
+		//
+		// It has to be here rather than in app.Use: a Fiber handler cannot reach the context
+		// gqlgen builds, so a value set with c.Locals is not what a resolver's ctx.Value sees.
+		// A resolver reads it back with ctx.Value(graph.RequestIDKey{}), which is why the key is
+		// declared in graph rather than here.
+		HTTPMiddleware: []func(http.Handler) http.Handler{
+			func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					id := r.Header.Get("X-Request-Id")
+					if id == "" {
+						id = strconv.FormatInt(time.Now().UnixNano(), 36)
+					}
+					w.Header().Set("X-Request-Id", id)
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), graph.RequestIDKey{}, id)))
+				})
+			},
+		},
+
+		// Configure is the seam for gqlgen itself, and it runs against the server that actually
+		// serves. SetDisableSuggestion turns off the "Did you mean ...?" hint gqlparser adds to
+		// an unknown-field error, which otherwise walks a caller through a schema that
+		// DisableIntrospection was meant to keep closed.
+		//
+		// Since 0.3.0 it can also register a transport — srv.AddTransport(...) — because luima's
+		// own transports are now registered after this runs. Before that, gqlgen selected
+		// transport.POST first and anything added here was silently unreachable.
+		Configure: func(srv *handler.Server) {
+			srv.SetDisableSuggestion(!dev)
+		},
 	})
 	// RequestTimeout is deliberately not set: it defaults to 15s, which is the point of putting it
 	// in the library rather than in a line every consumer has to remember.

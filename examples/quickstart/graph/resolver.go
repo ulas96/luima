@@ -12,6 +12,18 @@ import (
 // your auth context. gqlgen constructs it once and hands it to every resolver.
 type Resolver struct{ DB *pg.DB }
 
+// RequestIDKey @notice The context key main.go's HTTPMiddleware writes the request id under.
+//
+// @dev It lives in this package rather than in main so that a resolver can actually read it —
+// ctx.Value(graph.RequestIDKey{}) — which is the entire point of HTTPMiddleware. A key declared
+// where only the middleware can see it produces a value nothing can consume, and that mistake
+// compiles and runs.
+//
+// A named empty struct rather than a string: a string key collides with anything else in the
+// process that picked the same word, and the collision is silent — one package reads the other's
+// value and both look correct.
+type RequestIDKey struct{}
+
 // newUser @notice Builds a model.User from the GraphQL input and the primary key.
 //
 // @dev It lives here, not in schema.resolvers.go: codegen sweeps non-resolver declarations out
