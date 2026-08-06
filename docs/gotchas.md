@@ -41,6 +41,9 @@ below expand the ones that need more than a row.
 | 31 | SQL injection through a "safe" ORM | `OrderExpr`/`ColumnExpr`/`Having` interpolate raw SQL by design | Allowlist client-supplied identifiers ([below](#31-the-injection-surface-is-the-options-closure)) |
 | 32 | Check-then-write races under load | Each helper is one autocommitted statement | `db.RunInTransaction` + `q.For("UPDATE")` |
 | 33 | A DSN that lost its credentials connects anyway | go-pg falls back to `$PGUSER`/`$PGPASSWORD`, then literal `postgres` | Set `application_name` and check `pg_stat_activity` |
+| 34 | The client IP is the proxy's, even with `TrustProxy: true` | `TrustProxy` changes `fiber.Ctx` accessors; resolvers hold the adaptor's `*http.Request`, which it never touches | Parse `X-Forwarded-For` in `HTTPMiddleware` ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
+| 35 | `Secure` cookies are dropped, or a redirect loop, behind a TLS proxy | `r.TLS` is `nil` — the hop into the process really is plaintext | Gate on `X-Forwarded-Proto`, never on `r.TLS` ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
+| 36 | The playground loads through the proxy, then every query 404s | Its fetch URL embeds `Endpoint` verbatim, and the proxy stripped the path prefix | Pass the prefix through, or set `Endpoint` to the externally visible path ([deployment](deployment.md#behind-a-proxy-the-request-looks-plaintext--and-that-is-fine)) |
 
 ---
 

@@ -10,6 +10,25 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/deployment.md` § "Serving over TLS"** — the HTTP side of deployment, which the document
+  did not previously cover at all. Both shapes: `fiber.ListenConfig` for terminating TLS in the
+  process (and why that is HTTP/1.1 only — fasthttp ships no h2), and running behind a
+  TLS-terminating proxy, with a table of what a resolver actually sees on such a request. Three
+  silent failures are named: `Config.Fiber.TrustProxy` changes `fiber.Ctx` accessors and so is
+  invisible to resolvers, which hold an `*http.Request`; `r.TLS` is `nil`, so middleware that
+  infers HTTPS from it drops `Secure` cookies or redirect-loops; and a prefix-stripping proxy
+  breaks the playground's fetch URL, whose scheme is otherwise handled automatically.
+- **`docs/gotchas.md` rows 34–36** — the same three failures, indexed in the failure catalogue and
+  linked to the section above. All three qualify by that file's own bar: no error, no log line.
+
+### Removed
+
+- **`docs/security-review.md`, `AUTH_HANDOUT.md` and `AUTH_INTEGRATION.md`** — the three documents
+  `v0.2.1` added are no longer tracked here. No code changed; the fixes they describe are still in
+  the library and still described in the `0.2.0` entry below.
+
 ## [0.2.1] — 2026-08-05
 
 Documentation only. No code changed, so there is nothing to upgrade for — `v0.2.0` and `v0.2.1`
@@ -17,7 +36,7 @@ are the same library.
 
 ### Added
 
-- **[docs/security-review.md](docs/security-review.md)** — the component-by-component review of
+- **`docs/security-review.md`** — the component-by-component review of
   0.1.0 that produced `v0.2.0`, and the reasoning behind each fix. It was written but never
   tracked, which `v0.2.0` shipped a dangling reference to: `tests/context_test.go` cites
   "D-02 in docs/security-review.md" by finding ID. Left as written, against 0.1.0 — the

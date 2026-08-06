@@ -115,7 +115,7 @@ func TestResolverContext(t *testing.T) {
 //
 // The cancellation half is the part that matters in production. go-pg turns ctx.Done() into a
 // Postgres CancelRequest, so a resolver context that never cancels means an abandoned request
-// still runs its query to completion — which is D-02 in docs/security-review.md.
+// still runs its query to completion.
 //
 // @param t the test handle
 func TestRequestTimeout(t *testing.T) {

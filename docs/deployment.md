@@ -2,8 +2,8 @@
 
 [← back to the README](../README.md)
 
-These are all `pg.ParseURL` and Docker behaviours. All are surprising, and most are startup
-failures rather than warnings.
+`pg.ParseURL` and Docker behaviours, then serving over TLS. All are surprising; the Postgres ones
+are mostly startup failures rather than warnings, the serving ones mostly fail silently.
 
 ---
 
@@ -112,6 +112,89 @@ if err != nil {
 }
 defer db.Close()
 ```
+
+---
+
+## Serving over TLS
+
+luima never calls `Listen`. `New` returns a `*fiber.App` and hands it back, and `Mount` registers
+routes on a router you already have — so how the process reaches the network is yours to decide,
+and both shapes below are supported.
+
+### Terminating TLS in the process
+
+Fiber's `ListenConfig`, unchanged by luima:
+
+```go
+app := luima.New(luima.Config{Schema: …})
+
+log.Fatal(app.Listen(":443", fiber.ListenConfig{
+	CertFile:    "cert.pem",
+	CertKeyFile: "key.pem",
+}))
+```
+
+`ListenConfig.TLSConfig` takes a `*tls.Config` for mTLS or a pinned cipher list, and
+`AutoCertManager` takes an `*autocert.Manager` for ACME. `AutoCertManager` and `CertFile` together
+are an error, not a precedence rule.
+
+**This is HTTP/1.1 only.** Fiber advertises `NextProtos: []string{"http/1.1", "acme-tls/1"}`, and
+fasthttp ships no HTTP/2 implementation, so there is no h2 to negotiate and no way to configure one
+in. If you want HTTP/2 to the client, you want the next section — a proxy speaks h2 outward and
+HTTP/1.1 to this process.
+
+### Behind a proxy, the request looks plaintext — and that is fine
+
+Terminate TLS at nginx, Caddy, an ALB or Cloudflare and forward to `http://127.0.0.1:8080`. Nothing
+in luima reads the scheme, `r.TLS`, or any `X-Forwarded-*` header, so there is nothing to configure
+and nothing that breaks. This is the better-supported shape, and the one the quickstart assumes.
+
+What a resolver — or an `HTTPMiddleware` layer — actually sees on such a request:
+
+| | value |
+|---|---|
+| `r.TLS` | **`nil`** — the hop into this process really is plaintext |
+| `r.URL.Scheme` | **`""`** — origin-form request line, there is no scheme to parse |
+| `r.URL.String()` | the path, e.g. `/graphql` |
+| `r.Host` | the `Host` header, as the proxy sent it |
+| `r.RemoteAddr` | **the proxy's address**, never the client's |
+| `X-Forwarded-*` | present and unmodified — the adaptor copies every header verbatim |
+
+Three consequences, none of which produces an error:
+
+**`Config.Fiber.TrustProxy` does not do what it looks like it does.** It changes `c.Scheme()`,
+`c.IP()` and `c.Host()` — accessors on `fiber.Ctx`. Your resolvers never hold a `fiber.Ctx`; they
+hold the `*http.Request` the adaptor built, which `TrustProxy` does not touch. Setting it is not
+wrong, it is simply invisible downstream of `Mount`. Read the header yourself:
+
+```go
+cfg.HTTPMiddleware = []func(http.Handler) http.Handler{
+	func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ",")
+			ctx := context.WithValue(r.Context(), clientIPKey{}, strings.TrimSpace(ip))
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	},
+}
+```
+
+That is trustworthy only because your proxy *overwrites* `X-Forwarded-For` rather than appending to
+whatever the client sent. Exposed directly, it is client-controlled input and means nothing.
+
+**Middleware that infers HTTPS from `r.TLS != nil` will conclude the connection is insecure.** A
+session layer drops the `Secure` cookie attribute, a redirect-to-https helper bounces forever.
+Neither logs anything. Gate on the header instead:
+
+```go
+secure := r.Header.Get("X-Forwarded-Proto") == "https"
+```
+
+**Do not let the proxy strip a path prefix.** The playground's scheme is safe automatically — it
+builds its fetch URL as `location.protocol + '//' + location.host + endpoint`, so the browser's
+HTTPS carries — but `endpoint` is embedded verbatim. Serve luima under `/api/` with the prefix
+stripped and the page loads, then posts to `/graphql` while the world only routes `/api/graphql`.
+Pass the prefix through, or set `Config.Endpoint` to the externally visible path.
 
 ---
 
