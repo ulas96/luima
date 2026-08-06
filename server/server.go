@@ -101,6 +101,24 @@ type Config struct {
 	// @dev Zero means "unset", as with QueryCache.
 	ComplexityLimit int
 
+	// MaxDepth @notice Caps operation nesting depth. Default 15. Negative disables it.
+	//
+	// @dev Zero means "unset", as with QueryCache and ComplexityLimit. ComplexityLimit does not
+	// cover this: a 40-level query costs about 40 against a limit of 1000, so a cyclic schema —
+	// User.friends: [User!]! — passes it and multiplies into a resolver call per node per level.
+	// gqlgen ships no depth limiter of its own.
+	//
+	// The walk resolves fragment spreads out of doc.Fragments. It has to: a spread node carries
+	// no SelectionSet, so a walker that visits only Doc.Operations reads every fragment as a
+	// leaf and a 40-deep document passes at depth 1 — measured, and a two-line change to the
+	// attacking query. An inline fragment is a type condition and does not count as a level.
+	//
+	// 15 is chosen against the deepest document a default install serves, which is the
+	// playground's own introspection query: it measures 13, so the default clears it by two.
+	// TestMaxDepthAdmitsIntrospection pins that. If your schema legitimately nests deeper than
+	// this, raise it — the number is a starting point, not a finding about your schema.
+	MaxDepth int
+
 	// ErrorPresenter @notice The error contract. Default [luimaerr.PresentError].
 	ErrorPresenter graphql.ErrorPresenterFunc
 
@@ -197,6 +215,12 @@ func Mount(r fiber.Router, cfg Config) {
 			n = 1000
 		}
 		srv.Use(extension.FixedComplexityLimit(n))
+	}
+	if n := cfg.MaxDepth; n >= 0 {
+		if n == 0 {
+			n = 15
+		}
+		srv.Use(maxDepth{limit: n})
 	}
 
 	presenter := cfg.ErrorPresenter

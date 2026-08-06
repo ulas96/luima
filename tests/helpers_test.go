@@ -11,6 +11,10 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/vektah/gqlparser/v2"
@@ -88,4 +92,52 @@ func newStubSchemaFunc(exec func(context.Context) *graphql.Response) graphql.Exe
 		}),
 		exec: exec,
 	}
+}
+
+// newDeepStubSchema @notice The same stub over a self-referential type, so a document can nest
+// without bound.
+//
+// @dev Node.child: Node is the shape MaxDepth exists for — the cyclic schema SECURITY.md names,
+// where 40 levels of nesting costs about 40 against a complexity limit of 1000 and multiplies into
+// a resolver call per node per level. gqlgen validates every document against Schema(), so a
+// 40-deep query needs a schema that admits one; the single-field stub cannot express the attack.
+//
+// @return graphql.ExecutableSchema a schema whose Node type contains itself
+func newDeepStubSchema() graphql.ExecutableSchema {
+	return stubSchema{
+		schema: gqlparser.MustLoadSchema(&ast.Source{
+			Name:  "deep",
+			Input: "type Query { node: Node } type Node { name: String child: Node }",
+		}),
+	}
+}
+
+// postJSON @notice Builds a POST of an arbitrary GraphQL document.
+//
+// @dev postQuery is hardcoded to {ping}, which is every wiring test's whole payload. The depth
+// tests each need a different document, and json.Marshal rather than string concatenation because
+// those documents carry newlines.
+//
+// @param query          the GraphQL document
+// @return *http.Request a request transport.POST will serve
+func postJSON(query string) *http.Request {
+	body, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		panic(err) // a constant in the caller, so this is a broken test file, not a failure
+	}
+	req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+// nest @notice Builds a document nested to depth levels through Node.child.
+//
+// @param depth      how many levels of child to emit
+// @param leaf       the innermost selection
+// @return string    the selection set, without the enclosing braces
+func nest(depth int, leaf string) string {
+	if depth <= 1 {
+		return leaf
+	}
+	return "child { " + nest(depth-1, leaf) + " }"
 }
