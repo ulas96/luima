@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"testing"
@@ -157,5 +158,78 @@ func TestConfigure(t *testing.T) {
 	}
 	if execRan {
 		t.Error("the resolver ran despite the interceptor short-circuiting the operation")
+	}
+}
+
+// markerTransport @notice A transport that answers exactly what transport.POST answers, and says so.
+//
+// @dev Supports is deliberately a copy of transport.POST's — POST + application/json, no Accept
+// check — because that is the shape of the collision being tested. transport.SSE's Supports is a
+// strict subset of the same match, so if this one loses to POST, SSE would too.
+type markerTransport struct{}
+
+// Supports @notice Matches the same requests transport.POST does.
+//
+// @param r     the incoming request
+// @return bool whether this transport will serve it
+func (markerTransport) Supports(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return r.Method == http.MethodPost && mediaType == "application/json"
+}
+
+// Do @notice Writes a marker instead of executing anything, so the test can read which transport won.
+//
+// @param w the response writer
+func (markerTransport) Do(w http.ResponseWriter, _ *http.Request, _ graphql.GraphExecutor) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"data":{"servedBy":"configure"}}`))
+}
+
+// TestConfigureCanOutrankPOST @notice Pins that a transport registered in Configure is selected
+// ahead of luima's own transport.POST.
+//
+// @dev gqlgen picks the *first* transport whose Supports returns true (handler/server.go:132-139)
+// and AddTransport appends (:78-80). transport.POST's Supports is a superset of every streaming
+// transport's — SSE wants POST + application/json + Accept: text/event-stream, and POST never reads
+// Accept — so registering POST before Configure runs makes a Configure-registered streaming
+// transport unreachable by construction. It compiles, it mounts, it returns 200, and every
+// subscription silently degrades to one buffered response. This test is the only thing that
+// distinguishes that from working.
+//
+// @param t the test handle
+func TestConfigureCanOutrankPOST(t *testing.T) {
+	var execRan bool
+
+	app := fiber.New()
+	server.Mount(app, server.Config{
+		DisablePlayground: true,
+		Configure: func(srv *handler.Server) {
+			srv.AddTransport(markerTransport{})
+		},
+		Schema: newStubSchemaFunc(func(context.Context) *graphql.Response {
+			execRan = true
+			return &graphql.Response{Data: []byte(`{"ping":"pong"}`)}
+		}),
+	})
+
+	res, err := app.Test(postQuery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(b), `"servedBy":"configure"`) {
+		t.Errorf("response %s came from transport.POST — a Configure-registered transport is unreachable", b)
+	}
+	if execRan {
+		t.Error("gqlgen executed the operation, so luima's own transport served the request")
 	}
 }

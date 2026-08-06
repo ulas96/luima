@@ -130,8 +130,14 @@ type Config struct {
 	// that never escapes Mount, and a consumer wanting any of those has to abandon Mount —
 	// which is the whole library.
 	//
-	// It runs after every default above — transports, query cache, introspection, complexity,
+	// It runs after every default setter — query cache, introspection, complexity, depth,
 	// presenter — so it can override them rather than be silently overridden by them.
+	//
+	// AddTransport is the exception, and it is the one that was broken: luima's own transports
+	// are registered after this runs, so a transport registered here outranks them. Before
+	// 0.3.0 they were registered first, and since gqlgen selects the first transport whose
+	// Supports matches, a transport added here could never be selected — see the comment on
+	// the AddTransport calls in Mount.
 	Configure func(*handler.Server)
 
 	// Fiber @notice Passed through to fiber.New. Ignored by Mount.
@@ -175,15 +181,6 @@ func Mount(r fiber.Router, cfg Config) {
 	// spelled out below.
 	srv := handler.New(cfg.Schema)
 
-	// Answers the OPTIONS preflight so it reaches gqlgen instead of 405-ing. That is all it
-	// does: transport.Options sets the Allow header and nothing else, so this is *not* CORS —
-	// no Access-Control-Allow-Origin is set here or anywhere else in luima, and a preflight
-	// that returns 200 without one still fails in the browser. Add fiber's cors middleware with
-	// explicit origins if you need cross-origin access; see docs/fiber.md.
-	srv.AddTransport(transport.Options{})
-	srv.AddTransport(transport.GET{})
-	srv.AddTransport(transport.POST{})
-
 	if n := cfg.QueryCache; n >= 0 {
 		if n == 0 {
 			n = 1000
@@ -208,12 +205,31 @@ func Mount(r fiber.Router, cfg Config) {
 	}
 	srv.SetErrorPresenter(presenter)
 
-	// Last among the gqlgen knobs, deliberately: Configure sees the server with every default
+	// Last among the gqlgen setters, deliberately: Configure sees the server with every default
 	// above already applied, so it can override any of them. Moved earlier, an interceptor it
 	// registers could be shadowed by luima's own defaults with no error.
 	if cfg.Configure != nil {
 		cfg.Configure(srv)
 	}
+
+	// Transports go *after* Configure, and that inversion is load-bearing. gqlgen picks the
+	// first transport whose Supports returns true (handler/server.go:132-139) and AddTransport
+	// appends (:78-80), so registration order is precedence. transport.POST's Supports is a
+	// superset of every streaming transport's: SSE wants POST + application/json + an Accept of
+	// text/event-stream, and POST never reads Accept. Register POST first and a
+	// Configure-registered SSE transport is unreachable by construction — it compiles, it
+	// mounts, it returns 200, and every subscription silently degrades to one buffered
+	// response. TestConfigureCanOutrankPOST pins it. Every other default Configure must be able
+	// to override is a setter, and setters do not care about this order.
+	//
+	// transport.Options answers the OPTIONS preflight so it reaches gqlgen instead of 405-ing.
+	// That is all it does: it sets the Allow header and nothing else, so this is *not* CORS —
+	// no Access-Control-Allow-Origin is set here or anywhere else in luima, and a preflight
+	// that returns 200 without one still fails in the browser. Add fiber's cors middleware with
+	// explicit origins if you need cross-origin access; see docs/fiber.md.
+	srv.AddTransport(transport.Options{})
+	srv.AddTransport(transport.GET{})
+	srv.AddTransport(transport.POST{})
 
 	// Reverse order so HTTPMiddleware[0] is outermost — the slice reads top-to-bottom like the
 	// request path. Iterate forward instead and a logging middleware listed first silently runs
