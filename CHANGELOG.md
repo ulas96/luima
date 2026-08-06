@@ -10,8 +10,41 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-06
+
+Two bug fixes that were filed as features, one new bound, and a documentation pass that removes a
+claim this project had been repeating for three releases without measuring it.
+
+Everything is source-compatible except one thing: `luimaerr.CustomError` gains a third field, so
+an **unkeyed** composite literal — `&CustomError{"msg", err}` — no longer compiles. Use keyed
+fields: `&CustomError{UserMessage: "msg", InternalError: err}`. Keyed literals, which `go vet`'s
+`composites` check has always pushed you toward for a struct from another module, are unaffected.
+
+The one behaviour change to know about: operations nested deeper than 15 levels are now rejected. If
+your schema legitimately nests deeper than that, set `Config.MaxDepth` before upgrading.
+
 ### Added
 
+- **`Config.MaxDepth`** — caps operation nesting depth. Default 15, negative disables, zero means
+  unset, as with `QueryCache` and `ComplexityLimit`. `SECURITY.md` had already named the gap:
+  complexity does not bound depth, because a 40-level query costs about 40 against a limit of
+  1000, so a cyclic schema — `User.friends: [User!]!` — passes it and multiplies into a resolver
+  call per node per level. gqlgen ships no depth limiter. The walk resolves fragment spreads out of
+  `doc.Fragments`, and that is not an optimisation: a spread node carries no selection set, so a
+  limiter that walks only the operation reads every named fragment as a leaf, and a 40-deep document
+  behind `...F` measures 1 and executes. An inline fragment is a type condition, not a level. The
+  default is chosen against the deepest document a default install serves — the playground's own
+  introspection query, which measures 13.
+- **`crud.Create` takes query modifiers**, like the other four. The clause it needed was
+  `ON CONFLICT`, which is the only way to attempt an insert inside a transaction without a real
+  23505 aborting the whole thing — a suppressed conflict does not abort it.
+- **`luimaerr.CustomError.Code`** — becomes `extensions.code` on the wire. `crud.Create` sends
+  `CONFLICT`, `crud.Update` sends `NOT_FOUND`, and every redacted error sends
+  `INTERNAL_SERVER_ERROR`. Clients had to string-match a message that `crud.Create` builds from
+  caller-supplied text, which `docs/gotchas.md` #30 already documents as attacker-influenced. An
+  empty `Code` emits no extensions object, so responses that do not opt in are byte-identical to
+  `0.2.1`. Nothing here is auth-shaped: `UNAUTHENTICATED` and `FORBIDDEN` are not a library that
+  ships no auth's to define.
 - **`docs/deployment.md` § "Serving over TLS"** — the HTTP side of deployment, which the document
   did not previously cover at all. Both shapes: `fiber.ListenConfig` for terminating TLS in the
   process (and why that is HTTP/1.1 only — fasthttp ships no h2), and running behind a
@@ -20,8 +53,60 @@ will be listed here under **Changed** with the migration in one line.
   invisible to resolvers, which hold an `*http.Request`; `r.TLS` is `nil`, so middleware that
   infers HTTPS from it drops `Secure` cookies or redirect-loops; and a prefix-stripping proxy
   breaks the playground's fetch URL, whose scheme is otherwise handled automatically.
-- **`docs/gotchas.md` rows 34–36** — the same three failures, indexed in the failure catalogue and
-  linked to the section above. All three qualify by that file's own bar: no error, no log line.
+- **`docs/gotchas.md` rows 34–37.** 34–36 are the three TLS failures above. 37 is new: adding
+  `transport.MultipartForm` through `Configure` makes your endpoint reachable by a cross-site HTML
+  form, because `multipart/form-data` is a "simple" request that no preflight protects — a
+  mutation submitted from any origin executes with the caller's cookies. Measured. The docs
+  recommended that transport in three places with no warning attached. luima grows no CSRF field,
+  because it registers no transport that needs one, and `SECURITY.md` now records that the default
+  is closed.
+- **A request-ID `HTTPMiddleware` and a `Configure` block in the quickstart.** Both seams shipped in
+  `0.2.0` with no worked example outside the test suite.
+
+### Fixed
+
+- **`crud.Create` no longer redacts an insert the database deliberately suppressed.** `Create`
+  issues `RETURNING *`, so go-pg scans a result set — and an insert that produced no row arrives
+  as `pg.ErrNoRows`, which `Create` returned bare and `PresentError` redacted. A `BEFORE INSERT`
+  trigger returning `NULL` is the ordinary way to write a soft-ignore, needs no cooperation from the
+  caller, and made every such mutation answer `"internal server error"` while having done exactly
+  what the schema told it to. It now returns `(nil, nil)`, like `Get`. **Check the result** — a
+  caller assuming non-nil nil-dereferences the second time the same key is inserted.
+- **The default transports are registered after `Configure` runs.** gqlgen selects the first
+  transport whose `Supports` matches and `AddTransport` appends, so registration order is
+  precedence. `transport.POST` matches `POST` + `application/json` and never reads `Accept`, which
+  makes it a strict superset of what SSE matches — so a transport registered through `Configure`
+  could never be selected. It compiled, it mounted, it returned 200, and a subscription silently
+  answered with one buffered response. Nothing can have depended on the old order, since nothing
+  registered that way ever ran.
+- **The reason given for subscriptions being out of scope was false**, in six files including the
+  `0.1.0` entry below, which is left as written because it records what was believed then. The
+  adaptor does not buffer: a `Flush`ing handler streams eight chunked frames 400 ms apart through
+  `adaptor.HTTPHandlerWithContext`, and through plain `adaptor.HTTPHandler` too. What blocked
+  subscriptions was the transport order above, now fixed, and fasthttp not cancelling the request
+  context when a client disconnects — measured at twenty frames produced after hangup with
+  `ctx.Err() == nil`. That second one is the real blocker and it is upstream: a subscription must
+  disable `RequestTimeout` to outlive 15s, and disabling it removes the only bound there is.
+  `transport.Websocket` was not measured and nothing claims it now.
+- **`ErrorPresenter` is not the only path to the wire**, contrary to three files. gqlgen's
+  transports write their own errors before an executor exists, so a malformed JSON body comes back
+  as HTTP 400 with the body echoed into the message, unpresented and unredacted. Only the caller's
+  own bytes are exposed — but the claim is what someone leans on when deciding they need not
+  sanitize something. Measured alongside: errors gqlgen *does* hand to the presenter keep their
+  codes, so parse, validation and complexity rejections are byte-identical to gqlgen's own
+  `DefaultErrorPresenter`.
+- **Panics are fully answered by `Configure`, and nothing further is owed.** A panic in
+  `HTTPMiddleware` returns HTTP 500 and the process survives, with `RequestTimeout` enabled or not;
+  a `SetRecoverFunc` installed through `Configure` routes the recovered value through
+  `PresentError`, which redacts it — a DSN embedded in a panic came out as `"internal server
+  error"` with the detail on stderr only. This closes the last item `docs/security-review.md` left
+  half-open.
+- **Two anchors in `docs/gotchas.md` never resolved** — `#14-returning-` and `#30-create-s-label`.
+
+### Changed
+
+- **`luimaerr.CustomError` gains a `Code` field.** Unkeyed composite literals stop compiling;
+  migrate with `&CustomError{UserMessage: msg, InternalError: err}`.
 
 ### Removed
 
@@ -174,7 +259,8 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ulas96/luima/releases/tag/v0.3.0
 [0.2.1]: https://github.com/ulas96/luima/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ulas96/luima/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ulas96/luima/releases/tag/v0.1.0
