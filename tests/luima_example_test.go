@@ -3,7 +3,10 @@ package tests
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/go-pg/pg/v10/orm"
@@ -33,24 +36,43 @@ func ExampleNew() {
 	log.Fatal(app.Listen(":8080"))
 }
 
-// ExampleNew_production @notice Production settings: no playground, a raised body limit, and
-// timeouts.
+// ExampleNew_production @notice Production settings: no playground, a tighter complexity limit, a
+// raised body limit.
 //
-// @dev Anything in Fiber is passed through untouched — except ErrorHandler, which the adaptor
-// makes unreachable by always returning nil.
+// @dev No timeout appears here, and that is the example. Read and write default to 10s and 30s
+// and RequestTimeout to 15s, so the bounds are already in place — the point of putting them in
+// the library rather than in three lines every consumer has to remember.
+//
+// Fiber remains the spelling for everything luima does not promote, BodyLimit here, and anything
+// set there wins over the promoted field. It is passed through untouched — except ErrorHandler,
+// which the adaptor makes unreachable by always returning nil.
 func ExampleNew_production() {
 	app := luima.New(luima.Config{
 		Schema:               newStubSchema(),
 		DisablePlayground:    true,
 		DisableIntrospection: true,
 		ComplexityLimit:      300,
-		// RequestTimeout is left at its 15s default on purpose. Set it only when your resolvers
-		// have a different shape — it is what bounds the query, since nothing else does.
-		Fiber: fiber.Config{
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 30 * time.Second,
-			BodyLimit:    8 << 20,
-		},
+		Fiber:                fiber.Config{BodyLimit: 8 << 20},
+	})
+
+	log.Fatal(app.Listen(":8080"))
+}
+
+// ExampleNew_slowResolvers @notice Raising the bound that actually governs a slow query, and the
+// one that does not.
+//
+// @dev RequestTimeout is the deadline on the resolver's context, which go-pg turns into a socket
+// deadline and a Postgres CancelRequest. It is the one a slow query needs.
+//
+// WriteTimeout is not a second copy of it. fasthttp starts that deadline after the handler
+// returns, so it bounds writing the response and never the query — raising it to make room for a
+// slow resolver is a no-op, and it is raised here only because a 60-second query tends to produce
+// a response body large enough that a slow client needs longer than 30s to read it.
+func ExampleNew_slowResolvers() {
+	app := luima.New(luima.Config{
+		Schema:         newStubSchema(),
+		RequestTimeout: 60 * time.Second,
+		WriteTimeout:   90 * time.Second,
 	})
 
 	log.Fatal(app.Listen(":8080"))
@@ -117,4 +139,106 @@ func ExampleMount() {
 	})
 
 	log.Fatal(app.Listen(":8080"))
+}
+
+// ExampleRun @notice The whole server in one call, naming no Fiber type.
+//
+// @dev Run is New plus Listen plus the drain, and the reason to prefer it is the ordering trap it
+// removes rather than the lines it saves: New mounts before it returns, so anything registered on
+// the app afterwards lands behind /graphql and never runs. With Run there is no app to register
+// on, and HTTPMiddleware is the only place middleware can go — which is where it always belonged,
+// because it is the only layer that sees the request context the resolvers see.
+//
+// Returning an error rather than calling log.Fatal is what makes the defer above it run: os.Exit
+// skips deferred functions, so a log.Fatal on the listen call closes no pool.
+func ExampleRun() {
+	db, err := luima.Connect(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Cancel on SIGTERM, which is what an orchestrator sends before it kills the container.
+	// Run then stops accepting, lets in-flight requests finish, and returns.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// In a real application this is your generated schema.
+	if err := luima.Run(ctx, ":8080", luima.Config{Schema: newStubSchema()}); err != nil {
+		log.Print(err)
+	}
+}
+
+// ExampleRun_health @notice A liveness path for the orchestrator.
+//
+// @dev db.Ping already has the signature HealthCheck wants, so the common case is one field.
+// The context it receives carries a 2s deadline of its own — a probe that inherits the request
+// timeout and hangs for 15s reads to a load balancer as a slow server rather than a broken one.
+//
+// The path is not wrapped by HTTPMiddleware, so a rate limiter cannot 429 the probe.
+func ExampleRun_health() {
+	db, err := luima.Connect(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := luima.Run(ctx, ":8080", luima.Config{
+		Schema:      newStubSchema(),
+		Health:      "/healthz",
+		HealthCheck: db.Ping,
+	}); err != nil {
+		log.Print(err)
+	}
+}
+
+// ExampleCORS @notice Letting a browser SPA on another origin read the response.
+//
+// @dev luima answers the preflight already — transport.Options is why it is a 200 and not a 405 —
+// but it sets no Access-Control-Allow-Origin, so without this the browser refuses the response
+// and reports an error that names neither field. This is the fix, and it is net/http middleware,
+// so it is portable to chi, echo or plain net/http.
+//
+// Origins are exact and listed. There is no Credentials knob, deliberately: the combination that
+// makes a wildcard dangerous is not representable.
+func ExampleCORS() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := luima.Run(ctx, ":8080", luima.Config{
+		Schema: newStubSchema(),
+		HTTPMiddleware: []func(http.Handler) http.Handler{
+			luima.CORS(luima.CORSConfig{Origins: []string{"https://app.example.com"}}),
+		},
+	}); err != nil {
+		log.Print(err)
+	}
+}
+
+// ExampleRateLimit @notice Bounding what one caller can spend.
+//
+// @dev The hole this plugs is the one crud.List documents: an unbounded list field is reachable by
+// anyone who can send { users { id } }, and ComplexityLimit cannot see it because row count is not
+// an input to the complexity calculation.
+//
+// nil keys on r.RemoteAddr. Behind a proxy that is the proxy's address for every caller — one
+// bucket for all of them, and a limiter that limits nothing — so pass a key func reading whichever
+// header your proxy sets, and only if you control that proxy.
+func ExampleRateLimit() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := luima.Run(ctx, ":8080", luima.Config{
+		Schema: newStubSchema(),
+		HTTPMiddleware: []func(http.Handler) http.Handler{
+			// Outermost first: refuse before the query is parsed, not after.
+			luima.RateLimit(100, time.Minute, nil),
+			luima.CORS(luima.CORSConfig{Origins: []string{"https://app.example.com"}}),
+		},
+	}); err != nil {
+		log.Print(err)
+	}
 }

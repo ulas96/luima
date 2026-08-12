@@ -26,10 +26,10 @@
 // Import them directly when you want a narrower dependency — a package that returns a
 // *CustomError but must not pull in Fiber or gqlgen's handler wants luimaerr alone:
 //
-//	[github.com/ulas96/luima/server]   Config, New, Mount
+//	[github.com/ulas96/luima/server]   Config, New, Run, Mount, CORS, CORSConfig, RateLimit
 //	[github.com/ulas96/luima/crud]     Get, List, Create, Update, Delete
 //	[github.com/ulas96/luima/luimaerr] CustomError, PresentError, SQLState
-//	[github.com/ulas96/luima/db]       Connect
+//	[github.com/ulas96/luima/db]       Connect, ConnectWith, StatementTimeout
 //
 // The two spellings are interchangeable, not merely similar: the types below are aliases, so
 // luima.Config and server.Config are the same type and either constructor accepts either literal.
@@ -37,11 +37,13 @@
 // The cost of that convenience, stated plainly: every exported symbol lives at two import paths,
 // and a new sub-package export has to be added to this file by hand or it stays invisible from the
 // root. Aliases carry field and signature changes automatically — only genuinely new symbols can
-// be missed, and there are nine of them.
+// be missed, and there are fifteen of them.
 package luima
 
 import (
 	"context"
+	"net/http"
+	"time"
 
 	"github.com/go-pg/pg/v10"
 	"github.com/go-pg/pg/v10/orm"
@@ -60,11 +62,26 @@ type Config = server.Config
 // CustomError @notice Carries a message the client is allowed to see. See [luimaerr.CustomError].
 type CustomError = luimaerr.CustomError
 
+// CORSConfig @notice Which browser origins may read the GraphQL response. See [server.CORSConfig].
+type CORSConfig = server.CORSConfig
+
 // New @notice Builds a *fiber.App with the GraphQL endpoint and playground mounted.
 //
 // @param cfg        the server configuration; only Schema is required
 // @return *fiber.App an app ready for Listen. See [server.New].
 func New(cfg Config) *fiber.App { return server.New(cfg) }
+
+// Run @notice Builds the server, listens on addr, and blocks until ctx is done — then drains
+// in-flight requests and returns.
+//
+// @dev The whole server in one call, naming no Fiber type — which is the point of it, and is
+// asserted by the compiler in tests/luima_test.go rather than by review.
+//
+// @param ctx    cancel it to begin the drain; SIGTERM via signal.NotifyContext is the usual source
+// @param addr   the listen address, e.g. ":8080"
+// @param cfg    the server configuration; only Schema is required
+// @return error a bind failure, a shutdown that exceeded the drain window, or nil. See [server.Run].
+func Run(ctx context.Context, addr string, cfg Config) error { return server.Run(ctx, addr, cfg) }
 
 // Mount @notice Registers the GraphQL routes on a router you already have — an existing app, or
 // a group.
@@ -73,12 +90,45 @@ func New(cfg Config) *fiber.App { return server.New(cfg) }
 // @param cfg the server configuration; only Schema is required
 func Mount(r fiber.Router, cfg Config) { server.Mount(r, cfg) }
 
+// CORS @notice Cross-origin access as portable net/http middleware, for Config.HTTPMiddleware.
+//
+// @param c the origins and headers to allow
+// @return func(http.Handler) http.Handler middleware, outermost-first. See [server.CORS].
+func CORS(c CORSConfig) func(http.Handler) http.Handler { return server.CORS(c) }
+
+// RateLimit @notice Fixed-window limiter as portable net/http middleware, for
+// Config.HTTPMiddleware. Over the limit is 429 with Retry-After.
+//
+// @param n   requests allowed per window
+// @param per the window
+// @param key what to bucket on; nil means r.RemoteAddr
+// @return func(http.Handler) http.Handler middleware, outermost-first. See [server.RateLimit].
+func RateLimit(n int, per time.Duration, key func(*http.Request) string) func(http.Handler) http.Handler {
+	return server.RateLimit(n, per, key)
+}
+
 // Connect @notice Opens the pool the resolvers query through and proves it works.
 //
 // @param url     a postgres:// or postgresql:// connection string
 // @return *pg.DB a live pool, already proven with a round trip. See [db.Connect].
 // @return error  a parse failure, or the ping failure with the pool already closed
 func Connect(url string) (*pg.DB, error) { return luimadb.Connect(url) }
+
+// ConnectWith @notice Connect, plus the pg.Options tuning a DSN cannot express.
+//
+// @param url     a postgres:// or postgresql:// connection string
+// @param tune    called with the parsed options; nil is exactly Connect
+// @return *pg.DB a live pool, already proven with a round trip. See [db.ConnectWith].
+// @return error  a parse failure, or the ping failure with the pool already closed
+func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
+	return luimadb.ConnectWith(url, tune)
+}
+
+// StatementTimeout @notice A tune func for ConnectWith that bounds every query server-side.
+//
+// @param d the bound; Postgres cancels a statement that exceeds it. Zero or negative disables it.
+// @return func(*pg.Options) a tune func for ConnectWith. See [db.StatementTimeout].
+func StatementTimeout(d time.Duration) func(*pg.Options) { return luimadb.StatementTimeout(d) }
 
 // PresentError @notice The error contract, and Config.ErrorPresenter's default.
 //

@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/go-pg/pg/v10"
 	"github.com/go-pg/pg/v10/orm"
 
 	"github.com/ulas96/luima"
 	"github.com/ulas96/luima/crud"
+	luimadb "github.com/ulas96/luima/db"
 	"github.com/ulas96/luima/luimaerr"
 	"github.com/ulas96/luima/server"
 )
@@ -33,6 +36,19 @@ var (
 	_ luima.Config          = server.Config{}
 	_ *luimaerr.CustomError = &luima.CustomError{}
 	_ *luima.CustomError    = &luimaerr.CustomError{}
+	_ server.CORSConfig     = luima.CORSConfig{}
+	_ luima.CORSConfig      = server.CORSConfig{}
+
+	// The non-generic wrappers. runFn is not only a shim check: spelled out in full it names no
+	// Fiber type, which is the guarantee the whole Fiber-seam work exists for — checked here by
+	// the compiler rather than by review. Change Run to take or return anything from Fiber and
+	// this line stops building.
+	_, _ runFn   = luima.Run, server.Run
+	_, _ corsFn  = luima.CORS, server.CORS
+	_, _ rateFn  = luima.RateLimit, server.RateLimit
+	_, _ connFn  = luima.Connect, luimadb.Connect
+	_, _ connWFn = luima.ConnectWith, luimadb.ConnectWith
+	_, _ stmtFn  = luima.StatementTimeout, luimadb.StatementTimeout
 
 	// The CRUD five are generic wrappers rather than aliases, so the check is that each
 	// instantiates to exactly the signature of the crud original. Assigning both to one
@@ -54,6 +70,15 @@ var (
 // clause it needs is ON CONFLICT, which is the only way to attempt an insert inside a transaction
 // without a real 23505 aborting the whole thing.
 type (
+	middleware = func(http.Handler) http.Handler
+
+	runFn   = func(context.Context, string, luima.Config) error
+	corsFn  = func(luima.CORSConfig) middleware
+	rateFn  = func(int, time.Duration, func(*http.Request) string) middleware
+	connFn  = func(string) (*pg.DB, error)
+	connWFn = func(string, func(*pg.Options)) (*pg.DB, error)
+	stmtFn  = func(time.Duration) func(*pg.Options)
+
 	opt      = func(*orm.Query) *orm.Query
 	getFn    = func(context.Context, orm.DB, *row, ...opt) (*row, error)
 	listFn   = func(context.Context, orm.DB, ...opt) ([]*row, error)
