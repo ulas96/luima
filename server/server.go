@@ -14,6 +14,7 @@ package server
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"time"
 
@@ -88,6 +89,46 @@ type Config struct {
 	// statement_timeout via pg.Options.OnConnect. See SECURITY.md.
 	RequestTimeout time.Duration
 
+	// ReadTimeout @notice How long a client may take to send a whole request. Default 10s.
+	// Negative disables it.
+	//
+	// @dev Zero means "unset", as with RequestTimeout — and here the convention is load-bearing
+	// rather than tidy. Fiber fills in its own defaults for BodyLimit and Concurrency but assigns
+	// this one straight through (app.server.ReadTimeout = app.config.ReadTimeout), and fasthttp
+	// reads zero as no deadline at all. Without this field a zero Config lets one client hold a
+	// connection slot forever by dribbling a request body a byte at a time, against a default
+	// Concurrency of 262144 — and Shutdown cannot reclaim that slot either, because it does not
+	// close keep-alive connections.
+	//
+	// There is deliberately no IdleTimeout field: fasthttp's idleTimeout() returns ReadTimeout
+	// whenever IdleTimeout is zero, so this bounds the keep-alive wait too and a third field
+	// would only let the two be set apart, which nothing has asked for.
+	//
+	// Set Fiber.ReadTimeout instead and that one wins — luima only ever fills a zero.
+	// TestTimeoutPrecedence pins that.
+	//
+	// Applied by New, not by Mount. Mount is handed a router that already exists, so its
+	// timeouts are not this function's to set, for the same reason cfg.Fiber is ignored there.
+	ReadTimeout time.Duration
+
+	// WriteTimeout @notice How long the server may take to write a response. Default 30s.
+	// Negative disables it.
+	//
+	// @dev Cannot truncate a slow resolver, and not merely because RequestTimeout's 15s default
+	// fires first. fasthttp sets the write deadline *after* the handler returns, immediately
+	// before writing the response (serveConn's SetWriteDeadline, server.go) — so the two never
+	// overlap at all. That is where it differs from net/http, whose WriteTimeout starts when the
+	// request is read and does cover handler execution; a reader porting that intuition across
+	// will raise this field to make room for a long query and change nothing.
+	//
+	// What it bounds is a slow *reader*: a client that sends a valid query and then stops
+	// draining the socket, which no resolver deadline can see because by then the resolver has
+	// already returned. Raise it for a large response over a slow link. Raise RequestTimeout for
+	// a slow query.
+	//
+	// Fiber.WriteTimeout wins over it, and New applies it, as with ReadTimeout.
+	WriteTimeout time.Duration
+
 	// QueryCache @notice The parsed-query LRU size. Default 1000. Negative disables it.
 	//
 	// @dev Zero means "unset", not "off", because a zero-valued Config must not be the
@@ -158,9 +199,14 @@ type Config struct {
 	// the AddTransport calls in Mount.
 	Configure func(*handler.Server)
 
-	// Fiber @notice Passed through to fiber.New. Ignored by Mount.
+	// Fiber @notice Passed through to fiber.New, with ReadTimeout and WriteTimeout filled in
+	// where this leaves them zero. Ignored by Mount.
 	//
-	// @dev Fiber's BodyLimit defaults to 4 MB where net/http had none — irrelevant to
+	// @dev A field set here wins over the promoted one: this is a whole fiber.Config the caller
+	// built deliberately, so a non-zero value in it is an explicit answer and luima does not
+	// overrule it. See ReadTimeout for why a zero one cannot simply be passed through.
+	//
+	// Fiber's BodyLimit defaults to 4 MB where net/http had none — irrelevant to
 	// queries, and the thing to raise here the day you add the multipart transport. Read the
 	// CSRF cost before you add that transport: multipart/form-data is a "simple" request, so no
 	// preflight protects it and a cross-site HTML form can execute a mutation with the caller's
@@ -177,16 +223,152 @@ type Config struct {
 	// server's is in that path, but the claim that everything goes through the presenter is
 	// not one to build on.
 	Fiber fiber.Config
+
+	// Health @notice Liveness path, e.g. "/healthz". Empty disables it.
+	//
+	// @dev Registered by Mount alongside the GraphQL routes, so it works on an app, on a group,
+	// and on a router you built yourself. Without it, writing the smallest possible route is the
+	// last thing that forces a consumer to name a Fiber type.
+	//
+	// It is a separate route, so HTTPMiddleware does not wrap it — deliberately. A rate limiter
+	// that 429s the liveness probe takes the process out of the load balancer for being healthy
+	// and busy, which is the opposite of what the probe is for.
+	Health string
+
+	// HealthCheck @notice What Health calls. Nil means the path answers 200 whenever the process
+	// is up. A non-nil error is 503, and the error text is not sent to the client.
+	//
+	// @dev A function rather than a *pg.DB field, for three reasons that all point the same way:
+	// this package does not import go-pg today and this would be the only reason to start, luima
+	// would otherwise have to answer who closes the pool, and a real deployment checks more than
+	// one thing. go-pg's Ping already has this exact signature (go-pg/base.go:508, promoted onto
+	// *pg.DB), so the common case is:
+	//
+	//	HealthCheck: db.Ping
+	//
+	// The context passed in carries a 2s deadline of its own, and that is the point of the field
+	// rather than a detail of it. A liveness probe against a wedged database must answer 503; a
+	// probe that inherits the request timeout and hangs for 15s instead reads to every load
+	// balancer as a slow server rather than a broken one, and that is the difference between
+	// being rotated out and being left in.
+	//
+	// The check runs on its own goroutine, so a check that ignores the context it is handed still
+	// answers 503 at the deadline rather than hanging the probe. That goroutine outlives the
+	// response — there is no way to stop a function that does not watch its context — so a check
+	// that blocks forever leaks one goroutine per probe. Watch the context.
+	HealthCheck func(context.Context) error
+}
+
+// Run @notice Builds the server, listens on addr, and blocks until ctx is done — then drains
+// in-flight requests and returns. The whole server in one call, naming no Fiber type.
+//
+// @dev Fiber's own graceful path (ListenConfig.GracefulContext) is not used, for two reasons. It
+// throws the shutdown error away — gracefulShutdown hands it to the OnPostShutdown hook and
+// returns (fiber/listen.go:606-623) while Listen returns nil regardless, so a server that
+// force-closed live connections because the drain timed out would be indistinguishable from a
+// clean exit and the process would exit 0. And it starts its watcher before the listener exists
+// (:252-256), which is the same race this function has to close by hand below.
+//
+// The listener is created here rather than by Listen so that a bind failure is returned
+// synchronously — and so that ln.Close below has something to close. One consequence: net.Listen
+// with "tcp" is dual-stack, where Fiber's ListenConfig defaults to tcp4 (fiber/listen.go:167).
+// That is deliberate. Run is shaped like net/http.ListenAndServe and should bind like it.
+//
+// The startup banner is suppressed. Fiber prints it to stdout by default, and a library must not
+// choose the caller's logging any more than db.Connect may call log.Fatal. Log your own line
+// before calling Run.
+//
+// @param ctx  cancel it to begin the drain; SIGTERM via signal.NotifyContext is the usual source
+// @param addr the listen address, e.g. ":8080"
+// @param cfg  the server configuration; only Schema is required
+// @return error a bind failure, a shutdown that exceeded the drain window, or nil
+func Run(ctx context.Context, addr string, cfg Config) error {
+	if ctx.Err() != nil {
+		return nil // already cancelled: nothing to bind, nothing to drain
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	app := New(cfg)
+
+	errc := make(chan error, 1)
+	go func() { errc <- app.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true}) }()
+
+	select {
+	case err := <-errc:
+		return err // the listener died on its own
+	case <-ctx.Done():
+	}
+
+	// 10s matches Fiber's own ListenConfig.ShutdownTimeout default (fiber/listen.go:169). Not a
+	// Config field: a drain window is a property of the deployment's shutdown grace period, and a
+	// caller who needs a different one is holding the app, which is what New is for.
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	shutErr := app.ShutdownWithContext(sctx)
+
+	// Closing the listener here is what makes the receive below terminate, and it is not
+	// belt-and-braces. fasthttp's Shutdown returns nil immediately when Serve has not run yet — it
+	// checks s.ln == nil (fasthttp/server.go:2064), and s.ln is only appended inside Serve — so a
+	// context cancelled in the first microseconds shuts down a server that is not yet listening,
+	// closes nothing, and leaves Listener serving forever with nothing left to stop it. Closing it
+	// makes Accept fail, which fasthttp maps to io.EOF and Serve returns nil (server.go:2119).
+	// Redundant on the ordinary path, where Shutdown closed it already; a double close is an error
+	// nobody needs to hear about.
+	_ = ln.Close()
+
+	if shutErr != nil {
+		return shutErr
+	}
+	return <-errc
 }
 
 // New @notice Builds a *fiber.App with the GraphQL endpoint and playground mounted.
 //
+// @dev The only place in luima that owns a fiber.Config, and therefore the only place that can
+// bound the transport. Passing cfg.Fiber through untouched is what made a zero Config the
+// pathological one — see ReadTimeout.
+//
 // @param cfg        the server configuration; only Schema is required
 // @return *fiber.App an app ready for Listen, with cfg.Fiber applied
 func New(cfg Config) *fiber.App {
-	app := fiber.New(cfg.Fiber)
+	fc := cfg.Fiber
+	fc.ReadTimeout = resolveTimeout(fc.ReadTimeout, cfg.ReadTimeout, 10*time.Second)
+	fc.WriteTimeout = resolveTimeout(fc.WriteTimeout, cfg.WriteTimeout, 30*time.Second)
+
+	app := fiber.New(fc)
 	Mount(app, cfg)
 	return app
+}
+
+// resolveTimeout @notice Resolves one of luima's zero-means-default durations against the
+// equivalent field in cfg.Fiber.
+//
+// @dev Not a max() and not a chain of ||, because the three inputs mean three different things
+// and two of them collide on zero: Fiber's zero means "unset", luima's zero means "unset", and
+// luima's negative means "no deadline" — which has to reach fasthttp as the very zero the other
+// two use for "unset". Collapsing any pair of those silently disables a deadline or ignores a
+// negative.
+//
+// @param fromFiber cfg.Fiber's field; non-zero wins outright
+// @param fromLuima cfg.ReadTimeout or cfg.WriteTimeout; negative means "no deadline"
+// @param def       luima's default, used only when both are zero
+// @return time.Duration what fasthttp receives, where 0 is fasthttp's "no deadline"
+func resolveTimeout(fromFiber, fromLuima, def time.Duration) time.Duration {
+	switch {
+	case fromFiber != 0:
+		return fromFiber
+	case fromLuima < 0:
+		return 0
+	case fromLuima > 0:
+		return fromLuima
+	default:
+		return def
+	}
 }
 
 // Mount @notice Registers the same routes on a router you already have — an existing app, or a
@@ -198,6 +380,18 @@ func New(cfg Config) *fiber.App {
 // @param r   a *fiber.App or the result of app.Group(prefix)
 // @param cfg the server configuration; only Schema is required
 func Mount(r fiber.Router, cfg Config) {
+	// A panic where db.Connect returns an error, and the difference is whether the caller could
+	// ever recover: an unreachable database is an environment failure worth retrying, a nil schema
+	// is a programmer error that cannot become valid later. Without this, Mount succeeds, boot
+	// succeeds, a readiness probe that only checks the database succeeds — and then every request
+	// panics inside gqlgen's executor, is recovered by gqlgen's own handler, and comes back as
+	// "internal system error" with no extensions.code. That is not even luima's error contract, so
+	// an alert keyed on INTERNAL_SERVER_ERROR never fires; the first symptom is the volume of
+	// stack traces. Measured. TestMountRequiresSchema pins it.
+	if cfg.Schema == nil {
+		panic("luima: Config.Schema is nil — pass your generated.NewExecutableSchema(...)")
+	}
+
 	endpoint := cfg.Endpoint
 	if endpoint == "" {
 		endpoint = "/graphql"
@@ -257,9 +451,9 @@ func Mount(r fiber.Router, cfg Config) {
 	//
 	// transport.Options answers the OPTIONS preflight so it reaches gqlgen instead of 405-ing.
 	// That is all it does: it sets the Allow header and nothing else, so this is *not* CORS —
-	// no Access-Control-Allow-Origin is set here or anywhere else in luima, and a preflight
-	// that returns 200 without one still fails in the browser. Add fiber's cors middleware with
-	// explicit origins if you need cross-origin access; see docs/fiber.md.
+	// it sets no Access-Control-Allow-Origin, and a preflight that returns 200 without one still
+	// fails in the browser. Put CORS(...) in HTTPMiddleware for cross-origin access; Fiber's own
+	// cors middleware works too, registered before Mount. See docs/fiber.md.
 	srv.AddTransport(transport.Options{})
 	srv.AddTransport(transport.GET{})
 	srv.AddTransport(transport.POST{})
@@ -308,6 +502,36 @@ func Mount(r fiber.Router, cfg Config) {
 			title = "graphql"
 		}
 		r.Get(path, adaptor.HTTPHandler(playground.Handler(title, endpoint)))
+	}
+
+	if cfg.Health != "" {
+		check := cfg.HealthCheck
+		r.Get(cfg.Health, func(c fiber.Ctx) error {
+			if check == nil {
+				return c.SendStatus(http.StatusOK)
+			}
+
+			// 2s of the probe's own, not the request's: c.Context() carries no deadline on this
+			// route, since the timeout middleware wraps only the GraphQL handler.
+			ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+			defer cancel()
+
+			// On a goroutine, because cancelling a context does not stop a function that never
+			// reads it, and "503 rather than a hang" is the whole contract. Buffered by one so
+			// that goroutine can always send and exit when the deadline wins the race.
+			done := make(chan error, 1)
+			go func() { done <- check(ctx) }()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					return c.SendStatus(http.StatusServiceUnavailable)
+				}
+				return c.SendStatus(http.StatusOK)
+			case <-ctx.Done():
+				return c.SendStatus(http.StatusServiceUnavailable)
+			}
+		})
 	}
 }
 
