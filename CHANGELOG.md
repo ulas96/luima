@@ -10,6 +10,121 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-12
+
+A consumer can now write a complete, production-shaped luima server without importing Fiber.
+`examples/quickstart/main.go` is the proof: it imports `github.com/ulas96/luima` and nothing from
+`github.com/gofiber`, where before it named a Fiber type for timeouts, for a rate limiter and for
+graceful shutdown. Everything below is additive except the two entries under **Changed**.
+
+### Added
+
+- **`Run(ctx, addr, cfg)`** — build, listen, and block until `ctx` is done, then drain in-flight
+  requests and return. The whole server in one call, naming no Fiber type; a signature assertion in
+  `tests/luima_test.go` makes the compiler enforce that rather than review.
+
+  It replaces `New` + `app.Listen(addr, fiber.ListenConfig{GracefulContext: ctx})`, and not only for
+  the import. Fiber's own graceful path throws the shutdown error away — it hands it to the
+  `OnPostShutdown` hook while `Listen` returns nil regardless, so a server that force-closed live
+  connections because the drain timed out is indistinguishable from a clean exit and the process
+  exits 0. `Run` returns it. It also removes the ordering trap that kept the quickstart off `New`:
+  `New` mounts before it returns, so a later `app.Use` lands behind `/graphql` and never runs. With
+  `Run` there is no app to register on and `HTTPMiddleware` is the only seam — which is where
+  middleware belonged anyway, because it is the only layer that sees the resolvers' context.
+
+  The drain window is 10s, matching Fiber's own `ListenConfig.ShutdownTimeout` default. `Run` binds
+  dual-stack `tcp`, where `app.Listen` defaults to `tcp4`.
+
+- **`CORS(CORSConfig{...})`** — cross-origin access as `func(http.Handler) http.Handler`, for
+  `Config.HTTPMiddleware`. luima already answers the OPTIONS preflight — `transport.Options` is why
+  it is a 200 and not a 405 — but it set no `Access-Control-Allow-Origin`, so the browser refused
+  the response anyway and its error named neither field. The misconfiguration was the default.
+
+  Sets `Vary: Origin` on every response it touches, including refusals, which is the reason to
+  prefer it over four hand-written headers: the grant is echoed from a request header, and without
+  `Vary` a shared cache serves the first caller's grant to the second. Methods are fixed at GET,
+  POST and OPTIONS. There is deliberately no `Credentials` knob — the combination that makes a
+  wildcard origin dangerous is not representable. Use `rs/cors` in `HTTPMiddleware` if you need it;
+  that needs no Fiber import either.
+
+  One wart, documented at the symbol: `HTTPMiddleware` runs inside the adaptor and Fiber's timeout
+  middleware wraps outside it, so a request that hits `RequestTimeout` is answered without CORS
+  headers and the browser reports a CORS error rather than a timeout.
+
+- **`RateLimit(n, per, key)`** — fixed-window limiter as `func(http.Handler) http.Handler`, 429 with
+  `Retry-After` over the limit. This is the bound `ComplexityLimit` cannot supply: row count is not
+  an input to the complexity calculation, so an unbounded `{ users { id } }` costs the same as one
+  field. Fixed window, not sliding, so the real ceiling is 2n across a boundary. Counters are
+  dropped wholesale at each rollover — a per-key map with no eviction would be a memory-exhaustion
+  bug inside the feature that exists to prevent one. Per process: two replicas enforce 2n. `key` is
+  nil for `r.RemoteAddr`; read a header instead when you are behind a proxy you control, because
+  otherwise every caller shares the proxy's single bucket.
+
+- **`Config.Health` and `Config.HealthCheck`** — a liveness path, e.g. `/healthz`. Empty disables
+  it. A nil check answers 200 whenever the process is up; a non-nil error is 503 and the error text
+  stays server-side. `db.Ping` already has the signature, so the common case is `HealthCheck:
+  db.Ping`.
+
+  Registered by `Mount`, so it works on a group and on an app you built yourself, and it is *not*
+  wrapped by `HTTPMiddleware` — a rate limiter must not 429 the probe. The check gets a 2s deadline
+  of its own and runs on its own goroutine, so a check that never reads its context still answers
+  503 rather than hanging; a probe that hangs for 15s reads to a load balancer as a slow server
+  rather than a broken one.
+
+- **`db.ConnectWith(url, tune)` and `db.StatementTimeout(d)`** — the `pg.Options` tuning a DSN
+  cannot express. `pg.ParseURL` accepts only `sslmode`, `application_name` and `connect_timeout`, so
+  reaching anything else meant re-implementing the two things `Connect` does that are easy to lose:
+  the TLS `ServerName` fill without which `?sslmode=verify-full` cannot complete a handshake, and
+  the bounded boot round trip. `tune` runs after both and before `pg.Connect`.
+
+  `StatementTimeout` is the case worth pre-writing, and the gap `SECURITY.md` already named:
+  `RequestTimeout` reaches Postgres as a `CancelRequest`, which is best-effort — go-pg dials a
+  second connection to send it and only logs a failure — so a query can outlive its own
+  cancellation while holding a pooled connection. `statement_timeout` is enforced by the server
+  whether or not the client is still there. A query that exceeds it comes back as SQLSTATE `57014`,
+  readable with `luimaerr.SQLState`.
+
+  **`Connect(url)` is unchanged** and is now `ConnectWith(url, nil)` internally, so there is one
+  implementation of the TLS fix and the boot ping rather than two.
+
+- **`Config.ReadTimeout` and `Config.WriteTimeout`** — transport deadlines, defaulting to 10s and
+  30s. Zero means unset and negative disables, as with `RequestTimeout`. Setting one no longer
+  requires naming a Fiber type. `Config.Fiber` still takes precedence where both are set, so an
+  existing `Fiber: fiber.Config{ReadTimeout: …}` keeps working unchanged. There is no
+  `IdleTimeout`: fasthttp falls back to `ReadTimeout` when it is zero, so the keep-alive wait is
+  bounded by the same field.
+
+### Changed
+
+- **`Mount` now panics when `Config.Schema` is nil**, where before it mounted cleanly. This was
+  measured, not reasoned about: `Mount(app, Config{})` returned normally, the process booted, a
+  readiness check that only proved the database passed — and then every request panicked inside
+  gqlgen's executor, was recovered by gqlgen's own handler, and came back as
+  `{"errors":[{"message":"internal system error"}]}` with **no `extensions.code`**. That is gqlgen's
+  message, not luima's, so an alert keyed on `INTERNAL_SERVER_ERROR` never fired and the first
+  symptom was the volume of stack traces. A panic is right here where `db.Connect` returning an
+  error is right there: an unreachable database is an environment failure worth retrying, a nil
+  schema is a programmer error that cannot become valid later.
+
+  **Migration:** none. A build this affects was already broken; it now says so at boot instead of
+  once per request.
+
+- **A zero `Config` now ships a 10s read deadline and a 30s write deadline**, where before it
+  shipped neither. Fiber fills in its own defaults for `BodyLimit` and `Concurrency` but passes
+  the timeouts through verbatim, and fasthttp reads zero as *no deadline* — so one client could
+  hold a connection slot indefinitely by dribbling a request body a byte at a time, against a
+  default `Concurrency` of 262144, and `Shutdown` could not reclaim that slot either because it
+  does not close keep-alive connections. This contradicted the invariant that a zero `Config` is
+  the good configuration; it no longer does.
+
+  Only `New` — and therefore `Run` — is affected. `Mount` is handed a router that already exists
+  and never set its configuration, so an app you built with `fiber.New` yourself is unchanged.
+
+  **Migration:** if you were relying on an unbounded write deadline for a long-running query, set
+  `WriteTimeout: -1`. Realistically nobody is: `RequestTimeout` already bounds the resolver at 15s,
+  a full fifteen seconds before the new default, so this can only bite a consumer who disabled
+  `RequestTimeout` with a negative value too.
+
 ## [0.3.0] — 2026-08-06
 
 Two bug fixes that were filed as features, one new bound, and a documentation pass that removes a
@@ -259,7 +374,8 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ulas96/luima/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ulas96/luima/releases/tag/v0.3.0
 [0.2.1]: https://github.com/ulas96/luima/releases/tag/v0.2.1
 [0.2.0]: https://github.com/ulas96/luima/releases/tag/v0.2.0
