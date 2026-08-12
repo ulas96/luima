@@ -1,7 +1,8 @@
 // Package db @notice Opens the Postgres pool luima's resolvers query through.
 //
-// @dev One function, because connecting is the only part of the data layer that is the same in
-// every application. Everything else is your models and the crud package.
+// @dev Connecting is the only part of the data layer that is the same in every application.
+// Everything else is your models and the crud package. Connect is that sameness in one argument;
+// ConnectWith is the same function with the one seam a DSN cannot reach.
 package db
 
 import (
@@ -31,12 +32,12 @@ import (
 // Both postgres:// and postgresql:// schemes parse. ?connect_timeout=N bounds the whole boot
 // round trip here, not just the dial.
 //
-// Connect takes a URL and nothing else, deliberately. It is not the only way in: everything it
-// does is three exported calls, so tuning that pg.Options exposes and a DSN cannot express —
-// ReadTimeout, PoolSize, an OnConnect that sets statement_timeout — is a matter of calling
-// pg.ParseURL, editing the *pg.Options and calling pg.Connect yourself. Query timeouts do not
-// need that: server.Config.RequestTimeout puts a deadline on the resolver's context, and go-pg
-// turns that into both the socket deadline and a Postgres CancelRequest.
+// Connect takes a URL and nothing else, deliberately — a one-argument default that is correct is
+// why this package is one call. For tuning that pg.Options exposes and a DSN cannot express —
+// ReadTimeout, PoolSize, an OnConnect that sets statement_timeout — use ConnectWith, which is this
+// function with one more parameter. Query timeouts do not need either: server.Config.RequestTimeout
+// puts a deadline on the resolver's context, and go-pg turns that into both the socket deadline and
+// a Postgres CancelRequest.
 //
 // Unlike the server this was lifted from, Connect returns its error rather than calling
 // log.Fatal, and takes the URL rather than reading os.Getenv: a library must not kill the
@@ -48,6 +49,31 @@ import (
 // @return *pg.DB a live pool, already proven with a round trip; nil on error
 // @return error  a parse failure, or the ping failure with the pool already closed
 func Connect(url string) (*pg.DB, error) {
+	return ConnectWith(url, nil)
+}
+
+// ConnectWith @notice Connect, plus the pg.Options tuning a DSN cannot express.
+//
+// @dev A function rather than a struct of promoted fields: pg.Options has around twenty of them
+// and a struct would cover four, so every option luima did not think of would send the consumer
+// back to re-implementing this function — which means re-implementing the two things in it that
+// are easy to get wrong, the TLS ServerName fill and the bounded boot ping. tune sees the parsed
+// options after pg.ParseURL and before pg.Connect, which is the only point where any of them can
+// still be changed.
+//
+// It runs after the ServerName fill, so a consumer can override that too, and before the ping
+// reads opt.DialTimeout, so raising DialTimeout raises the boot round trip with it.
+//
+// A QueryHook does not need this — pg.DB.AddQueryHook takes one on the returned pool
+// (go-pg/hook.go:75). statement_timeout does, and StatementTimeout is that case pre-written.
+//
+// This costs no import a consumer does not already pay: the resolver root names *pg.DB.
+//
+// @param url   a postgres:// or postgresql:// connection string, as Connect takes
+// @param tune  called with the parsed options; nil is exactly Connect
+// @return *pg.DB a live pool, already proven with a round trip; nil on error
+// @return error  a parse failure, or the ping failure with the pool already closed
+func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
 	opt, err := pg.ParseURL(url)
 	if err != nil {
 		// url.Error's Error() is fmt.Sprintf("%s %q: %s", e.Op, e.URL, e.Err) — it embeds the
@@ -78,6 +104,10 @@ func Connect(url string) (*pg.DB, error) {
 		t.ServerName = host
 	}
 
+	if tune != nil {
+		tune(opt)
+	}
+
 	db := pg.Connect(opt)
 
 	// pg.Connect is lazy — it dials nothing. This is the round trip that proves the
@@ -102,4 +132,40 @@ func Connect(url string) (*pg.DB, error) {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 	return db, nil
+}
+
+// StatementTimeout @notice A tune func for ConnectWith that bounds every query server-side.
+//
+// @dev The one piece of pg.Options tuning worth wrapping, because getting it right is four fiddly
+// lines rather than an assignment: it has to run on every new pooled connection, the duration has
+// to reach Postgres as an integer number of milliseconds, and SET takes no bind parameter — so the
+// value is formatted into the statement, which is safe only because it is an int64.
+//
+// This is the bound RequestTimeout cannot be. A context deadline reaches Postgres as a
+// CancelRequest, and that is best-effort: go-pg dials a second connection to send it and only logs
+// a failure, so a query can outlive its own cancellation and hold a pooled connection that other
+// requests are queued behind. statement_timeout is enforced by the server whether or not the
+// client is still there. See SECURITY.md.
+//
+// The round-up is not tidiness. Milliseconds truncates, so any d under 1ms would reach Postgres as
+// "SET statement_timeout = 0" — which is Postgres for *no timeout at all*, turning a bound into
+// its own opposite silently. A zero or negative d still disables it, because that is what the
+// caller asked for.
+//
+// Overwrites any OnConnect already set; set yours after this one if you have both.
+//
+// @param d      the bound; Postgres cancels a statement that exceeds it (SQLSTATE 57014,
+// readable with luimaerr.SQLState). Zero or negative disables it.
+// @return func(*pg.Options) a tune func for ConnectWith
+func StatementTimeout(d time.Duration) func(*pg.Options) {
+	ms := d.Milliseconds()
+	if d > 0 && ms == 0 {
+		ms = 1
+	}
+	return func(o *pg.Options) {
+		o.OnConnect = func(ctx context.Context, cn *pg.Conn) error {
+			_, err := cn.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d", ms))
+			return err
+		}
+	}
 }

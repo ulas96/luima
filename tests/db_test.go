@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ulas96/luima/db"
+	"github.com/ulas96/luima/luimaerr"
 )
 
 // TestConnectRedactsDSN @notice Asserts a malformed connection string does not put the password
@@ -146,5 +148,43 @@ func TestConnectPingTimeout(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Connect never returned — the boot-time ping has no deadline")
+	}
+}
+
+// TestStatementTimeout @notice Proves the bound is enforced by Postgres, not by the client.
+//
+// @dev SKIPS without DATABASE_URL, like TestCRUD, and for the same reason: this is the only test
+// that can tell the two bounds apart. A test that merely asserted OnConnect was set would pass
+// against an implementation that never reaches the server.
+//
+// The assertion is the SQLSTATE. 57014 is query_canceled, which only the server sends — a
+// client-side context deadline surfaces as context.DeadlineExceeded with no SQLSTATE at all, and
+// that is precisely the failure mode RequestTimeout already has and this exists to fix.
+//
+// 50ms rather than something tighter: OnConnect runs on the same connection ConnectWith then
+// proves with `select 1`, so a bound short enough to catch that round trip makes the test flaky
+// rather than strict.
+//
+// @param t the test handle
+func TestStatementTimeout(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set — skipping the server-side timeout round trip")
+	}
+
+	conn, err := db.ConnectWith(url, db.StatementTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	// No deadline on this context, deliberately: with one, a pass would prove nothing about
+	// where the cancellation came from.
+	_, err = conn.ExecContext(context.Background(), "select pg_sleep(1)")
+	if err == nil {
+		t.Fatal("select pg_sleep(1) succeeded under a 50ms statement_timeout")
+	}
+	if state := luimaerr.SQLState(err); state != "57014" {
+		t.Errorf("SQLState(%v) = %q, want 57014 (query_canceled) — the bound has to be the server's", err, state)
 	}
 }
