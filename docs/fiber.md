@@ -113,8 +113,9 @@ Two things did block them:
   than 15s, and disabling it removes the only bound there is, so an abandoned subscription holds a
   goroutine and its database work forever. **This one is upstream**, and it is the real blocker.
 
-`transport.Websocket` was not measured. fasthttp exposes no `http.Hijacker`, so it is very likely
-still impossible, but this document does not claim that.
+`transport.Websocket` was not measured. The adaptor implements `http.Hijacker` as of fasthttp v1.72
+(`fasthttpadaptor/adaptor.go`), which is the interface gorilla's `Upgrader.Upgrade` type-asserts, so
+it is no longer structurally blocked — but this document does not claim it works.
 
 ---
 
@@ -136,10 +137,37 @@ srv.AddTransport(transport.POST{})
 `handler.New` adds none. Without `Options{}`, see consequence 1 above.
 
 **`transport.Options` is not CORS.** It sets exactly one header — `Allow` — and returns 200. That
-fixes the 405; it does not make a cross-origin request work, because no
-`Access-Control-Allow-Origin` is set by luima anywhere. A preflight that returns 200 without one
-still fails in the browser. If you need cross-origin access, add Fiber's own middleware, with
-explicit origins:
+fixes the 405; it does not make a cross-origin request work, because it sets no
+`Access-Control-Allow-Origin`. A preflight that returns 200 without one still fails in the browser,
+with an error message that names neither field. `luima.CORS` is the fix, and it goes in
+`HTTPMiddleware` rather than on the app:
+
+```go
+luima.Run(ctx, ":8080", luima.Config{
+    Schema: schema,
+    HTTPMiddleware: []func(http.Handler) http.Handler{
+        luima.CORS(luima.CORSConfig{Origins: []string{"https://app.example.com"}}),
+    },
+})
+```
+
+Origins are exact and listed, and a single `"*"` is the only wildcard. There is no `Credentials`
+knob: `Access-Control-Allow-Credentials` with a wildcard origin is the classic misconfiguration,
+and the case it serves needs an auth layer luima does not ship — leaving the field out makes the
+combination unrepresentable, which is stronger than validating it.
+
+It sets `Vary: Origin` on every response it touches, including the ones it refuses. That line is
+the reason to prefer it over four hand-written headers: the grant is echoed from a request header,
+so without `Vary` any shared cache — a CDN, a corporate proxy, the browser's own store — serves the
+first caller's `Access-Control-Allow-Origin` to the second, and the symptom is a CORS failure that
+reproduces for one user and no one else.
+
+**One wart.** `HTTPMiddleware` runs inside the adaptor and Fiber's `timeout` middleware wraps
+outside it, so a request that hits `RequestTimeout` is answered by that middleware and its 408
+carries no CORS headers — the browser then reports a CORS error rather than a timeout. Fixing it
+would move CORS outside the adaptor and cost the portability that is the point.
+
+Fiber's own middleware still works, registered before `Mount`:
 
 ```go
 app.Use(cors.New(cors.Config{AllowOrigins: []string{"https://app.example.com"}}))
@@ -149,7 +177,8 @@ luima.Mount(app, cfg)
 Explicit, because `cors.New()` with no config defaults to `AllowOrigins: []string{"*"}`. That is
 not catastrophic on its own — `AllowCredentials` defaults to `false`, so cookies are not sent
 cross-origin — but it becomes a data leak the moment your auth is a header token your own SPA
-holds, or you flip `AllowCredentials` to make cookie auth work.
+holds, or you flip `AllowCredentials` to make cookie auth work. `rs/cors` in `HTTPMiddleware` is
+the third option, and it needs no Fiber import either.
 
 (`HEAD`, while you are here: `Options.Do` answers it with 405. Nothing depends on it.)
 

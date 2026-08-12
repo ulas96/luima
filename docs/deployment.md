@@ -207,8 +207,9 @@ Pass the prefix through, or set `Config.Endpoint` to the externally visible path
 > query runs with full access to every row.
 >
 > There is no auth middleware, no token validation, no per-request role switching. Put something
-> in front of luima before it faces the internet: an API gateway, a Fiber middleware of your own
-> on the group you `Mount` onto, or a reverse proxy that terminates auth.
+> in front of luima before it faces the internet: an API gateway, your own middleware in
+> `Config.HTTPMiddleware`, a Fiber middleware on the group you `Mount` onto, or a reverse proxy
+> that terminates auth. `luima.RateLimit` is not that something — it bounds volume, not access.
 >
 > The error presenter redacts driver text so an unauthenticated caller cannot read your schema off
 > a failed query. That is damage control, not authorization.
@@ -221,10 +222,25 @@ that walks the whole path.
 If you need per-user RLS, connect as an unprivileged role and set the request's claims per
 transaction — that is a real design, and it is out of scope for v1.
 
-`examples/quickstart/main.go` is the deployable shape: HTTP timeouts, a rate limiter, playground
-and introspection behind `LUIMA_DEV`, a bounded list query and a graceful shutdown on SIGTERM. It
-is the one file in the repo that deliberately does not use the zero `luima.Config`, because a
-library call has no deployment context and an application does.
+`examples/quickstart/main.go` is the deployable shape: a server-side `statement_timeout`, a
+`/healthz` liveness path, a rate limiter, CORS, playground and introspection behind `LUIMA_DEV`, a
+bounded list query and a graceful shutdown on SIGTERM through `luima.Run`. HTTP timeouts do not
+appear in it, because read, write and request now default to 10s, 30s and 15s. It is the one file
+in the repo that deliberately does not use the zero `luima.Config`, because a library call has no
+deployment context and an application does — and it imports no Fiber package, which is the property
+to preserve when copying it.
+
+**The liveness path.** `Health` is registered by `Mount`, so it works on an app you built yourself
+too, and `HTTPMiddleware` does not wrap it — the rate limiter cannot 429 the probe and take a
+healthy-but-busy process out of rotation. `HealthCheck` receives a context with a 2s deadline and
+runs on its own goroutine, so a wedged database answers 503 rather than hanging: a probe that hangs
+reads to a load balancer as a slow server rather than a broken one, and slow servers are left in.
+`db.Ping` already has the signature.
+
+**Draining.** `luima.Run` returns its error instead of exiting, which is what lets a
+`defer db.Close()` above it run — `log.Fatal` calls `os.Exit` and skips every deferred function.
+The drain window is 10s. Set your orchestrator's termination grace period above that, or it will
+`SIGKILL` the process mid-drain.
 
 ---
 

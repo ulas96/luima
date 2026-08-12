@@ -19,8 +19,8 @@ connection string for most managed Postgres providers is — then **Row Level Se
 apply to it**, and every GraphQL query runs with full access to every row. Nothing in luima
 narrows that.
 
-Put authentication in front of it: an API gateway, a reverse proxy that terminates auth, or your
-own Fiber middleware on the group you `Mount` onto.
+Put authentication in front of it: an API gateway, a reverse proxy that terminates auth, your own
+middleware in `Config.HTTPMiddleware`, or a Fiber middleware on the group you `Mount` onto.
 
 ### Getting the caller's identity into a resolver
 
@@ -116,16 +116,35 @@ wait with it, and turns cancellation into a Postgres `CancelRequest` against the
 Without it, an unauthenticated caller can fire expensive queries and disconnect, and the server
 completes every one of them.
 
-`CancelRequest` is best-effort — it dials a second connection and only logs a failure. For a bound
-Postgres enforces itself, set `statement_timeout` on the role, or build `*pg.Options` yourself with
-an `OnConnect` that does it and call `pg.Connect` instead of `luima.Connect`.
+`CancelRequest` is best-effort — it dials a second connection and only logs a failure, so a query
+can outlive its own cancellation while holding a pooled connection every other request is queued
+behind. For a bound Postgres enforces itself whether or not the client is still there:
 
-Set the HTTP timeouts too. Fiber defaults only `BodyLimit`; `ReadTimeout`, `WriteTimeout` and
-`IdleTimeout` pass through as zero, which fasthttp reads as no timeout at all. See
-`examples/quickstart/main.go`.
+```go
+db, err := luima.ConnectWith(os.Getenv("DATABASE_URL"), luima.StatementTimeout(10*time.Second))
+```
+
+A query that exceeds it comes back as SQLSTATE `57014`, which `luima.SQLState` reads; a client-side
+deadline gives you `context.DeadlineExceeded` and no SQLSTATE, which is how you tell the two apart.
+Setting `statement_timeout` on the role does the same thing one layer down, and is the better answer
+when more than one application shares the role.
+
+The HTTP timeouts are set for you as of `ReadTimeout`/`WriteTimeout`: read defaults to 10s and write
+to 30s, and read also bounds the keep-alive wait, since fasthttp falls back to it when `IdleTimeout`
+is zero. That matters because Fiber defaults only `BodyLimit` and passes the three timeouts through
+verbatim, and fasthttp reads zero as no timeout at all — a zero `Config` used to serve 262144
+connection slots a client could hold open forever by dribbling a request body. This applies to `New`
+and `Run`; an app you built with `fiber.New` and handed to `Mount` still owns its own.
+
+**Volume is not bounded by default.** `luima.RateLimit(n, per, key)` in `Config.HTTPMiddleware` is
+the smallest useful bound and answers 429 with `Retry-After`. It is per process — two replicas
+enforce 2n — and it is a fixed window, so a caller straddling a boundary lands 2n inside one
+window's width. Real rate limiting, with a shared store and a notion of who is calling, belongs in
+the layer that does auth.
 
 **Complexity is capped at 1000 by default.** That is a blunt instrument against pathological
-queries, not a rate limiter, and it is narrower than it sounds:
+queries, and not the same thing as the rate limiter above — it bounds one query's shape, not how
+many a caller may send. It is narrower than it sounds:
 
 - The cost is **per selected field**. A list field costs the same whether it returns one row or ten
   million, so the limit does nothing about an unbounded `SELECT`. Bound your lists with
