@@ -10,6 +10,25 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+### Changed
+
+- **luima now requires a Go 1.27 toolchain** (was 1.25). Both `go.mod` files declare `go 1.27.0`.
+
+  What this costs a consumer, stated plainly: your own module's `go` directive does **not** have to
+  move — a module still declaring `go 1.25.0` compiles against this release unchanged. What must
+  move is the toolchain. With `GOTOOLCHAIN=auto` (the default) that is an automatic download and
+  you will not notice it; pin `GOTOOLCHAIN` to an older release and the build stops with
+  `go: go.mod requires go >= 1.27.0`. If that pin is not yours to change, stay on 0.4.0.
+
+  No exported symbol changed, no dependency was added, removed or upgraded. Internally `errors.As`
+  became `errors.AsType` in the three places that only ever needed the matched value —
+  `db.Connect`'s URL-error branch, `luimaerr.PresentError`'s `*CustomError` branch, and
+  `luimaerr.SQLState`. Identical chain-walking semantics, one line less each.
+  `PresentError`'s `*gqlerror.Error` branch is deliberately **not** among them: it stays a bare
+  type assertion, because that is the redaction contract — an `errors.As`-family call there would
+  walk the chain and let any resolver ship server internals to the client by wrapping a
+  `*gqlerror.Error`.
+
 ## [0.4.0] — 2026-08-12
 
 A consumer can now write a complete, production-shaped luima server without importing Fiber.

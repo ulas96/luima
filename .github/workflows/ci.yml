@@ -20,7 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.25', '1.26']
+        # One row on purpose. The go directive says 1.27, so GOTOOLCHAIN=auto makes an older
+        # runner download 1.27 and test the exact same toolchain — extra rows cost minutes and
+        # prove nothing. Add a row back only if the directive drops below the runner version.
+        go: ['1.27']
 
     # TestCRUD skips silently without DATABASE_URL, and a skipped test still reads as "ok".
     # This service container is what stops the only test that proves anything from rotting into
@@ -81,10 +84,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.27'
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.12.2
+          version: v2.13.1
 
   # Both modules: they have different dependency graphs, since the example pulls in gqlgen's CLI
   # through its tool directive. luima's whole job is wiring four other libraries together, so a
@@ -97,7 +100,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           # Load-bearing here specifically: most of what govulncheck reports for this module is
           # the standard library, and "fixed in" means a toolchain patch release. Pinned to the
           # minor without this, the job reports every stdlib CVE since .0 and never goes green.
@@ -118,7 +121,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.27'
 
       - name: build
         run: go build ./...

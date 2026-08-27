@@ -2,8 +2,8 @@
 // error is allowed to tell a client.
 //
 // @dev It is named luimaerr rather than errors because a package called errors shadows the
-// standard library in every file that imports both — and PresentError itself calls errors.As
-// twice.
+// standard library in every file that imports both — and this file calls into it three times
+// (errors.AsType in PresentError and in SQLState, errors.New for the redacted message).
 //
 // It imports nothing else in luima, so a package that must not pull in Fiber or gqlgen's handler
 // can still return a *CustomError.
@@ -93,8 +93,7 @@ func (e *CustomError) Unwrap() error { return e.InternalError }
 // @param err  the error a resolver returned
 // @return *gqlerror.Error the message the client receives, with the field path attached
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
-	var ce *CustomError
-	if errors.As(err, &ce) {
+	if ce, ok := errors.AsType[*CustomError](err); ok {
 		out := &gqlerror.Error{Message: ce.UserMessage, Path: graphql.GetPath(ctx)}
 		// Only when set, so a zero CustomError is byte-identical on the wire to what 0.2.1
 		// sent. An empty code would be worse than none: a client branching on
@@ -110,9 +109,9 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	// every schema typo would read as "internal server error" and debugging a client would be
 	// impossible.
 	//
-	// A type assertion, not errors.As, and that distinction is the whole redaction contract.
-	// errors.As walks the chain, so any error that *wraps* a *gqlerror.Error anywhere inside it
-	// would be returned whole — and one line of ordinary-looking error handling,
+	// A type assertion, not errors.As/errors.AsType, and that distinction is the whole redaction
+	// contract. Those walk the chain, so any error that *wraps* a *gqlerror.Error anywhere inside
+	// it would be returned whole — and one line of ordinary-looking error handling,
 	// fmt.Errorf("insert into %s failed for tenant %d: %w", table, tenantID, gqlErr), would
 	// then ship the table name and the tenant id to the client. Unwrapping here makes redaction
 	// opt-*out*. gqlgen hands its own parse and validation errors to the presenter unwrapped,
@@ -159,15 +158,17 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 // if one branch for the whole 23xxx class is enough.
 //
 // pg.Error is an *interface* (error + Field(byte) + IntegrityViolation()), not a struct
-// pointer and not pgx's *pgconn.PgError — so the errors.As target is `var pgErr pg.Error`.
-// Getting this wrong is the most common bug when porting error handling between the two
-// drivers: it fails to compile in one direction and silently never matches in the other.
+// pointer and not pgx's *pgconn.PgError — so the type argument here is pg.Error itself, and the
+// pre-1.27 errors.As spelling of the same thing declares `var pgErr pg.Error` with no `*` and
+// still passes `&pgErr` — errors.As always takes a pointer, and passing pgErr itself panics at the
+// first driver error that reaches it. Getting this
+// wrong is the most common bug when porting error handling between the two drivers: it fails to
+// compile in one direction and silently never matches in the other.
 //
 // @param err     any error, including nil and wrapped chains
 // @return string the five-character SQLSTATE, or "" when no pg.Error is in the chain
 func SQLState(err error) string {
-	var pgErr pg.Error
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[pg.Error](err); ok {
 		return pgErr.Field('C')
 	}
 	return ""
