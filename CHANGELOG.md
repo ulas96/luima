@@ -10,6 +10,15 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-27
+
+One call now scaffolds a table's CRUD layer. `luimagen.Generate` — and the `cmd/luimagen` binary
+over it — writes the Go model struct, appends the matching SDL, runs the consumer's own
+`go tool gqlgen generate`, and fills in the five resolver stubs it produces. It is a separate
+package that nothing in the library imports, so `github.com/ulas96/luima` gains no surface from it
+and the "no scaffolding CLI" line below still describes the library consumers import. The only
+thing this release asks of an existing consumer is a Go 1.27 toolchain.
+
 ### Added
 
 - **`luimagen`** (`github.com/ulas96/luima/luimagen`, plus a `cmd/luimagen` CLI) — generates a
@@ -497,7 +506,8 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ulas96/luima/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ulas96/luima/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ulas96/luima/releases/tag/v0.3.0
 [0.2.1]: https://github.com/ulas96/luima/releases/tag/v0.2.1
