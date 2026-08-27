@@ -10,6 +10,110 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+### Added
+
+- **`luimagen`** (`github.com/ulas96/luima/luimagen`, plus a `cmd/luimagen` CLI) — generates a
+  table's CRUD layer from its fields in one call: `luimagen.Generate(luimagen.Options{Type:
+  "User", Fields: [...]})` **writes the Go model struct** (not just SDL and resolvers — a plain
+  `Field{Name, Type, PK}` slice is the only input, no hand-written struct required), appends the
+  matching GraphQL SDL to `schema.graphqls`, runs the consumer's own `go tool gqlgen generate`,
+  and fills in the five resulting resolver stubs with calls to
+  `luima.Get`/`List`/`Create`/`Update`/`Delete`. It is a separate package, not re-exported through
+  `luima.go` — importing `github.com/ulas96/luima` gains no new surface. luimagen never touches
+  the database itself: the table is expected to already exist, created however the consumer
+  already creates tables. See `docs/luimagen.md` for the design and its constraints.
+
+  Validation happens before any file is written — every check is read-only and runs ahead of the
+  first `os.WriteFile`, so a rejected call leaves nothing on disk. `Options.Type` and every
+  `Field.Name` must be an exported Go identifier, no two fields may collide on the derived column
+  name or the derived GraphQL field name (`URLValue` and `UrlValue` both become `url_value`; `ID`
+  and `Id` both become `id`), and the mapped Go types are exactly the ones
+  that round-trip through gqlgen's default bindings: an array-typed PK, a PK-only table, and
+  `int64`/`uint*`/`float32` (gqlgen turns GraphQL `Int` into Go `int` and `Float` into
+  `float64`, so other widths generate resolver code that does not compile — use `string`/`int`/
+  `float64`/`bool`) are all errors. A `_` anywhere in `Options.Type` or a `Field.Name` is an error
+  too, and it is the one that does not look wrong: `_` is a legal Go identifier rune, but
+  `templates.ToGo` treats it as a word delimiter and drops it, so `Owner_Name` comes back as
+  `OwnerName` and the generated resolver references a field that does not exist. Both must also be
+  ASCII, which a Go identifier need not be: a GraphQL `Name` is `/[_A-Za-z][_0-9A-Za-z]*/`, so an
+  accented name is a legal struct field whose derived SDL field cannot parse. `Options.Table` and
+  `Field.Column` are checked against everything `%q` escapes — a backslash or a tab passes a
+  two-character check and lands in the raw-string `pg:"…"` tag as a literal escape sequence go-pg
+  reads as part of the name. `snakeCase` matches go-pg's own column-naming boundary for initialisms
+  (`URLValue` → `url_value`, not `urlvalue`), and **`Field.Column` overrides it** (`-field
+  Name:Type[:pk][:column=<sql name>]`) for the case that rule cannot derive: a run of capitals gets
+  no separator at all, so `URLID` becomes `urlid` where the table almost certainly says `url_id`.
+  luimagen does not create the table, so that mismatch compiles, vets and lints clean and fails on
+  the first query — `Options.Table` was already the same escape hatch one level up. Non-string primary keys generate the create/update label through
+  `fmt.Sprintf("user %v", id)` — the type name is baked into the format string — instead of a
+  string concat, and the generated `List` caps at 100 rows with a comment saying so: luima ships
+  no pagination.
+
+  The last check is the composed schema itself: before anything is written, the existing schema
+  sources plus the fragment about to be appended are loaded through gqlparser — the
+  same parser gqlgen runs — so a collision the type-name guard cannot see is an error rather than
+  a half-written tree. A hand-declared `Query.settings`, a pre-existing `input SettingInput`, and
+  two types whose naive `+"s"` plurals meet (`User` and `Users` both claiming `Query.users`) are
+  all rejected up front. A set that does not parse *before* the fragment is added is left alone:
+  `gqlgen.yml` may glob files luimagen never reads, so an unresolved reference in that partial
+  view is not luimagen's to report.
+
+  **luimagen reads the names gqlgen generated rather than predicting them.** gqlgen runs SDL names
+  through `templates.ToGo`, which re-capitalizes 24 common initialisms, so `Field{Name: "OwnerId"}`
+  comes back as `UserInput.OwnerID` and `Type: "URL"` comes back as the resolver method `URl`.
+  Resolver methods are matched case-insensitively (for a delimiter-free name `ToGo` only re-cases,
+  never changes letters, so this is exact), and so is the lookup for the generated input struct
+  itself — `Type: "ApiKey"` declares SDL `input ApiKeyInput` and gets back `type APIKeyInput`.
+  Generated input field names are read out of `<ModelDir>/*.go`. Neither costs a dependency, and
+  neither drifts when gqlgen's initialism list changes. The patched signature must have exactly the
+  parameter count luimagen's SDL generates: too many means the field carries an argument luimagen
+  never declared, and splicing anyway would discard a value the client sent. After the splice, all
+  five methods must be present **and none of them may still panic** — a partially patched file
+  compiles, so a surviving `panic` would otherwise only fire at query time. That second half
+  covers the body luimagen deliberately does *not* touch: a hand-written
+  `panic("TODO: needs an ownership predicate")` is left alone, which is right, but finishing the
+  run silently would have the CLI report all five as filled over a live panic. The patched file is
+  written *before* that error is returned: every splice the patcher made is correct whatever the
+  completeness check then finds, and discarding them would leave the caller holding the model file,
+  the appended SDL and a regenerated module with none of the bodies filled — a state no re-run can
+  redo, since the duplicate-type guard now rejects the type.
+
+  The patched resolver file's import declarations are merged into one canonical block — stdlib
+  group, blank line, third-party group, sorted — from the post-splice AST, and every `fmt` import is
+  pruned by whether its *binding* is still used rather than by text matching, so an aliased
+  `f "fmt"` the splice made dead is dropped instead of surviving unused beside a freshly added
+  `"fmt"`. Adding an import is keyed on the same thing: an aliased `l "github.com/ulas96/luima"`
+  already satisfies "this path is imported" while binding no name a spliced `luima.Get` can use,
+  so the check is for an *unaliased* import — two imports of one path is legal Go, a body naming
+  an unbound package is not. An add also requires the *name* to be free: a resolver file that binds
+  `luima` to a fork gets an error naming the conflict rather than a second unaliased import and
+  `luima redeclared in this block`, which `format.Source` cannot catch because it does not typecheck. A body that is not gqlgen's own
+  `panic(fmt.Errorf("not implemented: …"))` stub is left alone, hand-written placeholders included.
+
+  The generated model file carries a NatSpec doc comment, because it lands in the consumer's module
+  where `revive`'s `exported` rule would flag a bare `type User struct` as an error on code they did
+  not write; `writeModel` creates `ModelDir` if it does not exist yet, and takes the file's
+  `package` clause from the `.go` files already there rather than from `Options.ModelPkg`, which is
+  the identifier the resolver bodies prefix and differs whenever gqlgen aliased the import. The
+  declare-vs-extend probe and the duplicate guard are answered from `parser.ParseSchema` — so a
+  `type Query` inside a `"""` description or a `#` comment is not a declaration, and a name taken by
+  an `input` or `scalar` counts too — across every file beside `Options.SchemaFile` sharing its
+  extension, which is what gqlparser reads and what the documented layout globs. `appendSDL` still
+  writes to `Options.SchemaFile` alone.
+
+  `Options.Dir` is the consumer module's root: `go tool gqlgen generate` runs there, and
+  `ModelDir`/`SchemaFile`/`ResolverFile` are relative to it unless absolute, and `ResolverFile`
+  itself defaults to `SchemaFile` with `.resolvers.go` for its extension — where gqlgen's
+  `resolver.layout: follow-schema` puts the stubs, so moving `-schema` alone does not leave luimagen
+  patching a file with none of the five methods in it. `cmd/luimagen` exposes `Dir` as `-dir`,
+  alongside `-type`, `-field`, `-table`, `-model-dir`, `-schema`, `-resolvers` and `-model-pkg`.
+
+  `make luimagen-roundtrip` (also a step of the `example` CI job) runs the whole pipeline against a
+  scratch copy of `examples/quickstart` and builds the result. It is the only check that reaches the
+  gqlgen half: `luimagen/internal_test.go` is deliberately no-exec, and `format.Source` does not
+  typecheck, so `go build` on real generated code is the only thing that proves a spliced body and a
+  rewritten import block compile.
+
 ### Changed
 
 - **luima now requires a Go 1.27 toolchain** (was 1.25). Both `go.mod` files declare `go 1.27.0`.

@@ -35,7 +35,8 @@ generate` produces. Consumers still own `gqlgen.yml`, `schema.graphqls`, `graph/
 | `luimaerr/` | the error contract. Imports nothing else in luima — keep it that way |
 | `db/` | connection |
 | `luima.go` | re-export shim; see below |
-| `tests/` | every test and runnable example, for all five packages |
+| `tests/` | every test and runnable example for the five library packages |
+| `luimagen/` | the CRUD generator's library — `Field`, `Options`, `Generate`; never imported by `luima.go`, and the one package that keeps its own tests. See `docs/luimagen.md` |
 
 **`luima.go` is a hand-maintained shim.** Types are aliases (`luima.Config` *is* `server.Config`,
 so field changes carry for free); the five generic CRUD functions are wrappers, because Go has no
@@ -49,6 +50,12 @@ than by review.
 the exported surface — the same view a consumer has. Nothing there can touch an unexported symbol.
 Trade-off: `Example` functions don't render on pkg.go.dev under their symbols (godoc binds by
 directory), but they still compile and their `Output` blocks still run.
+
+`luimagen/internal_test.go` is the one exception, and `package luimagen`. The rule buys a
+consumer's-eye view of an API, and `Generate` has almost none — one call that shells out to gqlgen
+and rewrites files. Everything worth pinning is in the unexported steps between: `snakeCase`'s
+go-pg boundary, `lowerFirst`, the declare-vs-extend probe, `patchSource`'s splice and its import
+fix. `tests/luimagen_test.go` still covers the exported surface from outside. `docs/luimagen.md` §5.
 
 ### The two load-bearing invariants
 
@@ -105,7 +112,10 @@ question to answer first is which `Config` field or free function is missing.
 
 - Doc comments use NatSpec tags inside ordinary godoc comments: open with the symbol name, then
   `@notice` (what), `@dev` (why it's written that way), `@param`/`@return`.
-  `examples/quickstart/graph/schema.resolvers.go` is exempt — gqlgen rewrites it.
+  `examples/quickstart/graph/schema.resolvers.go` is exempt — gqlgen rewrites it; `luimagen/gen.go`
+  and `luimagen/patch.go` are exempt — they are one internal pipeline, and their reasoning is
+  carried as prose here and in `docs/luimagen.md` §2 rather than split across thirty tag blocks.
+  `luimagen/luimagen.go` and `cmd/luimagen/main.go` are not exempt: they are the exported surface.
 - Comments explain what breaks if the line is removed (`All` not `Post`, the two absence signals in
   `Update`, `RETURNING *`). If code moves, the comment moves with it.
 - A behaviour change needs a test that fails without it; new public API needs a godoc example in
@@ -114,6 +124,10 @@ question to answer first is which `Config` field or free function is missing.
 ## Out of scope, deliberately
 
 Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations, a scaffolding CLI.
+
+The one exception is `cmd/luimagen`, a separate binary that scaffolds a table's CRUD layer —
+`github.com/ulas96/luima` itself gains no new surface from it, since nothing in the library imports
+it. Full reasoning: `docs/luimagen.md` §1.
 
 Also out, and each for a reason that survives being asked again: **a routing facade** (wrapping
 `Group`/`Get`/`Static` re-implements Fiber behind a worse API — `New` returning the app is the

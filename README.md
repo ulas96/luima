@@ -517,6 +517,7 @@ serving over TLS and behind a proxy, and production database settings.
 | [The gqlgen contract](docs/gqlgen-contract.md) | Generated files, resolver layout, autobinding, and schema checks |
 | [Fiber integration](docs/fiber.md) | Methods, context propagation, middleware behavior, buffering, and CORS |
 | [Deployment](docs/deployment.md) | PostgreSQL URLs, TLS verification, `.env` in Docker, serving over TLS and behind a proxy, and security posture |
+| [luimagen](docs/luimagen.md) | The `cmd/luimagen` CRUD generator: what it writes, what it refuses, and how to recover from a failed run |
 | [Gotchas](docs/gotchas.md) | Known failure modes and their fixes |
 | [Quickstart module](examples/quickstart) | Complete runnable server |
 
