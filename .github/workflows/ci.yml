@@ -139,3 +139,29 @@ jobs:
           go tool gqlgen generate
           git diff --exit-code -- . \
             || { echo "::error::run 'go tool gqlgen generate' and commit the result"; exit 1; }
+
+      # The half of luimagen that shells out to gqlgen and rewrites its real output cannot be
+      # reached by luimagen/internal_test.go, which is deliberately no-exec — two naming bugs sat
+      # under a green suite for exactly that reason. This is the only job with gqlgen available as
+      # a tool, and a scratch copy is the only place a round trip can run, since Generate rewrites
+      # the schema, the model directory and the resolver file in place. ApiKey rather than User on
+      # purpose: gqlgen renames ApiKeyInput to APIKeyInput and OwnerId to OwnerID through
+      # templates.ToGo, and that drift is what this catches.
+      - name: luimagen round trip
+        working-directory: ${{ github.workspace }}
+        run: |
+          scratch="$RUNNER_TEMP/luimagen-roundtrip"
+          rm -rf "$scratch" && mkdir -p "$scratch"
+          # Through a file, not a pipe: bash -e only checks the last command in a pipeline, so a
+          # producing tar that died partway would leave a truncated copy nothing here notices.
+          tar -cf "$RUNNER_TEMP/repo.tar" --exclude=.git .
+          tar -xf "$RUNNER_TEMP/repo.tar" -C "$scratch"
+          cd "$scratch/examples/quickstart"
+          go run github.com/ulas96/luima/cmd/luimagen -type ApiKey -table api_keys \
+            -field ApiKeyID:string:pk -field OwnerId:string -field 'Scopes:[]string'
+          go build ./...
+          go vet ./...
+          if grep -rn 'not implemented' graph/*.resolvers.go; then
+            echo "::error::luimagen left an unfilled stub — these COMPILE and panic at runtime"
+            exit 1
+          fi
