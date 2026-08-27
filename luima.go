@@ -14,6 +14,9 @@
 // Out of scope in v1, deliberately: auth, pagination, filtering, dataloaders, subscriptions,
 // file upload, migrations, a scaffolding CLI.
 //
+// The one exception is cmd/luimagen, a separate binary that scaffolds a table's CRUD layer —
+// this package gains no new surface from it, since nothing in the library imports it.
+//
 // # The packages
 //
 // This package re-exports the four sub-packages so the common case needs one import:
