@@ -84,8 +84,7 @@ func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
 		//
 		// Only this branch needs it: pg.ParseURL's own errors — the unsupported-option and
 		// missing-database ones — do not include the URL.
-		var ue *neturl.Error
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*neturl.Error](err); ok {
 			return nil, fmt.Errorf("parse database url: %s: %w", ue.Op, ue.Err)
 		}
 		return nil, fmt.Errorf("parse database url: %w", err)

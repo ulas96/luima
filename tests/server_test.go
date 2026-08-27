@@ -327,8 +327,7 @@ func TestRunReturnsOnContext(t *testing.T) {
 		}
 		defer ln.Close()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 
 		if err := server.Run(ctx, ln.Addr().String(), server.Config{Schema: newStubSchema()}); err == nil {
 			t.Error("Run on a held port = nil, want a bind error")

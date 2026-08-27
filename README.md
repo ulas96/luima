@@ -46,7 +46,7 @@ once `RequestTimeout` is disabled — which a subscription requires. See
 
 ## Install
 
-Luima requires Go 1.25. It currently targets Fiber v3, gqlgen v0.17, and go-pg v10.
+Luima requires Go 1.27. It currently targets Fiber v3, gqlgen v0.17, and go-pg v10.
 
 ```sh
 go get github.com/ulas96/luima
