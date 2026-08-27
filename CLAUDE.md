@@ -8,9 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make test        # go test ./...  — TestCRUD SKIPS, see below
 make test-db     # sources .env, go test -v -count=1 ./...  — TestCRUD runs
 make lint        # golangci-lint run
-make check       # gofmt + vet + lint + test-db + example — run before any PR
+make check       # gofmt + vet + lint + audit + test-db + example + luimagen-roundtrip — before any PR
 make example     # build examples/quickstart, grep for unfilled resolver stubs
 make example-generate  # re-run gqlgen in the example, then `git add examples/quickstart`
+make luimagen-roundtrip  # scaffold a type into a scratch copy of the example — needs gqlgen
 ```
 
 Single test: `go test -v -count=1 -run TestCRUD ./tests/` (with `DATABASE_URL` set for that one).
