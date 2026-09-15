@@ -11,8 +11,8 @@ linters:
     - unconvert
     - revive
     # The linter that catches the errors.As-where-a-type-assertion-was-meant bug. That distinction
-    # is the whole redaction contract in luimaerr.PresentError: errors.As walks the chain, so
-    # matching *gqlerror.Error with it lets any resolver bypass redaction by wrapping one.
+    # is one of the three checks in luimaerr.PresentError's pass-through: errors.As walks the
+    # chain, so matching *gqlerror.Error with it lets any resolver bypass redaction by wrapping one.
     - errorlint
 
   settings:

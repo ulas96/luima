@@ -48,9 +48,11 @@ offer a second one through `Config.Fiber.ErrorHandler` and does not document one
 sets it and assumes their resolver errors flow through it has built a redaction layer that never
 runs.
 
-**It is not the only path to the wire, and that distinction matters.** Transport-level failures are
-written by gqlgen's transport *before* an executor exists, so they never reach the presenter and
-are not redacted. POST a malformed JSON body and the response is HTTP 400 with your own bytes
+**It is not the only path to the wire, and that distinction matters.** A request no transport
+accepts is answered `"transport not supported"` by gqlgen's handler before any transport runs, so it
+never reaches the presenter. A malformed JSON body does reach it — `transport.POST` reports it
+through `Executor.DispatchError` — but as a `*gqlerror.Error` with no cause, reported outside field
+resolution, so it passes through unredacted and the response is HTTP 400 with your own bytes
 reflected back:
 
 ```
@@ -58,14 +60,15 @@ reflected back:
  beginning of value body:{\"query\": SECRET-CANARY-abc"}],"data":null}
 ```
 
-Same for `"transport not supported"`. Nothing of the *server's* is in that path — it is the
-caller's own body coming back to the caller — but do not decide you need not sanitize something on
-the strength of "everything goes through `PresentError`".
+Nothing of the *server's* is in either path — it is the caller's own body coming back to the
+caller — but do not decide you need not sanitize something on the strength of "everything goes
+through `PresentError`".
 
 The good news, measured alongside: errors gqlgen *does* hand to the presenter keep their codes.
 Parse (`GRAPHQL_PARSE_FAILED`), validation (`GRAPHQL_VALIDATION_FAILED`) and complexity
 (`COMPLEXITY_LIMIT_EXCEEDED`) rejections come out byte-identical to gqlgen's own
-`DefaultErrorPresenter` — the `*gqlerror.Error` pass-through branch carries them for free.
+`DefaultErrorPresenter` — the pass-through for a `*gqlerror.Error` that wraps nothing and was
+reported outside field resolution carries them for free.
 
 ---
 

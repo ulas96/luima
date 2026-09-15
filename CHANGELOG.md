@@ -24,6 +24,45 @@ will be listed here under **Changed** with the migration in one line.
   old behaviour, since no connection configured that way could run a query. Only the lower end is
   clamped: a duration above `2147483647ms`, about 24.8 days, is still refused the same way.
 
+### Security
+
+- **`luimaerr.PresentError` now redacts what resolvers report — it never did.** gqlgen does not
+  hand the presenter a resolver's error as returned: `graphql.ResolveField` passes it through
+  `graphql.AddFieldLocationToError`, `graphql.AddError` passes it through `graphql.ErrorOnPath`,
+  and both wrap an error that holds no `*gqlerror.Error` in one whose message is `err.Error()`
+  verbatim. The pass-through meant for gqlgen's own errors matched any top-level
+  `*gqlerror.Error`, so in every release so far a bare driver error — `relation "app_users" does
+  not exist`, a constraint name — reached the client as written, with no `extensions.code` and no
+  log line, while every test that called `PresentError` directly passed. A `*gqlerror.Error` now
+  passes through only if it wraps no other error and was reported outside field resolution, which
+  is how gqlgen reports parse, validation, variable and complexity errors and a malformed body, and
+  how luima reports its depth limit. Anything else that is not a `*CustomError` is logged and
+  answered `internal server error` with `INTERNAL_SERVER_ERROR`, keeping its `path` and
+  `locations` when they belong to the request being answered.
+
+  Clients now get that answer, where they used to get the error's own text, for: an error returned
+  by a resolver, a field directive or `AroundFields` middleware, or by an argument directive;
+  anything sent with `graphql.AddError` or `graphql.AddErrorf` while a field resolves; every
+  `*gqlerror.Error` reported while a field resolves, with or without a cause, its own `extensions`
+  included — `gqlerror.Errorf(...)`, one built by hand, a `gqlerror.List` decoded from an upstream
+  GraphQL response; a resolver panic, whether gqlgen's default recover function answers it (its
+  `internal system error` carried no code) or one installed with `SetRecoverFunc` does; gqlgen's
+  null violations (`must not be null`, `the requested element is null which the schema does not
+  allow`); `introspection disabled`, for a `__schema` or `__type` query when
+  `DisableIntrospection` is set; a client's bad value for a custom scalar, gqlgen's built-in `Time`
+  included; and a variable default that does not parse for a custom scalar, which is still answered
+  HTTP 422 but with `INTERNAL_SERVER_ERROR` in place of `GRAPHQL_VALIDATION_FAILED`. Each of these
+  also writes a `resolver error` log line, so any client can produce one at will — a `__schema`
+  query with introspection disabled is enough — and an alert keyed on `INTERNAL_SERVER_ERROR` sees
+  it.
+
+  **Migration:** send a message meant for the client as a `*luimaerr.CustomError`, whose `Code`
+  becomes `extensions.code`. It is heard from a resolver, a directive, a recover function or an
+  `UnmarshalGQL` alike, through gqlgen's wrapper, so a scalar that should explain its format to the
+  client has to be your own rather than gqlgen's built-in binding. Do not share one
+  `*gqlerror.Error` value between requests: gqlgen writes the first request's path and locations
+  into it.
+
 ## [0.5.0] — 2026-08-27
 
 One call now scaffolds a table's CRUD layer. `luimagen.Generate` — and the `cmd/luimagen` binary

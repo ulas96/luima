@@ -138,8 +138,8 @@ func StatementTimeout(d time.Duration) func(*pg.Options) { return luimadb.Statem
 // @dev A function rather than a var: a package-level var would let any consumer reassign the
 // error contract for every other consumer in the binary.
 //
-// @param ctx  the resolver context, read only for the GraphQL field path
-// @param err  the error a resolver returned
+// @param ctx  the request context, read for the field context and the path
+// @param err  the error gqlgen reports; a resolver's arrives already wrapped
 // @return *gqlerror.Error the message the client receives. See [luimaerr.PresentError].
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	return luimaerr.PresentError(ctx, err)

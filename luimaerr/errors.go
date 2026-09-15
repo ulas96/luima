@@ -2,8 +2,8 @@
 // error is allowed to tell a client.
 //
 // @dev It is named luimaerr rather than errors because a package called errors shadows the
-// standard library in every file that imports both — and this file calls into it three times
-// (errors.AsType in PresentError and in SQLState, errors.New for the redacted message).
+// standard library in every file that imports both — and this file calls into it twice
+// (errors.AsType, in PresentError and in SQLState).
 //
 // It imports nothing else in luima, so a package that must not pull in Fiber or gqlgen's handler
 // can still return a *CustomError.
@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"slices"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/go-pg/pg/v10"
@@ -81,16 +82,26 @@ func (e *CustomError) Unwrap() error { return e.InternalError }
 // Resolvers have to opt in to being heard: return a bare errors.New("user already exists") and
 // the client sees "internal server error". That is the design, and it is most of why the CRUD
 // helpers in the crud package exist — they do the classification so a resolver cannot forget it.
+// A *CustomError is the only way in for anything reported while a field resolves: a resolver's
+// error, a directive's, graphql.AddError and graphql.AddErrorf, an argument's unmarshalling, a
+// recovered panic.
 //
-// It is not, however, the only path to the wire. A transport-level failure — a malformed JSON body,
-// an unsupported content type — is written by gqlgen's transport before an executor exists, so it
-// never reaches this function and is not redacted. See the note on Config.Fiber in the server
-// package. Errors gqlgen generates and hands here keep their own extensions.code
-// (GRAPHQL_PARSE_FAILED, GRAPHQL_VALIDATION_FAILED, COMPLEXITY_LIMIT_EXCEEDED) through the
-// pass-through branch below.
+// err is almost never the error the resolver produced. graphql.ResolveField passes a returned
+// error through graphql.AddFieldLocationToError, and graphql.AddError passes whatever it is given
+// through graphql.ErrorOnPath. Both use errors.As, so an error with a *gqlerror.Error anywhere in
+// its chain comes back as it went in, and any other is wrapped with gqlerror.WrapPath: Message is
+// err.Error() verbatim, and Unwrap returns err. So a resolver's plain error arrives with the same
+// type as a parse error, and the pass-through below cannot go by type alone.
 //
-// @param ctx  the resolver context, read only for graphql.GetPath
-// @param err  the error a resolver returned
+// Nor does everything on the wire come through here, and the boundary is not the obvious one. A
+// request no transport accepts, such as one with an unsupported content type, is answered
+// "transport not supported" by handler.Server.ServeHTTP and never presented, and transport.GET
+// writes its own refusals. A malformed JSON body is presented: transport.POST reports it through
+// Executor.DispatchError as a cause-less *gqlerror.Error quoting the body back, so it passes
+// through. That text is the caller's own bytes.
+//
+// @param ctx  the request context, read for the field context and the path
+// @param err  the error gqlgen reports; a resolver's arrives already wrapped (see above)
 // @return *gqlerror.Error the message the client receives, with the field path attached
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	if ce, ok := errors.AsType[*CustomError](err); ok {
@@ -104,19 +115,39 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 		}
 		return out
 	}
-	// Parse and validation errors are gqlgen's own text about the query the client just sent,
-	// so they disclose nothing about the server. They pass through unchanged — without this,
-	// every schema typo would read as "internal server error" and debugging a client would be
-	// impossible.
+	// Parse, validation and limit errors are gqlgen's own text about the request the client just
+	// sent, so they disclose nothing about the server. They pass through unchanged — without
+	// this, every schema typo would read as "internal server error" and debugging a client would
+	// be impossible. Three checks recognise them, and weakening any one of them leaks.
 	//
-	// A type assertion, not errors.As/errors.AsType, and that distinction is the whole redaction
-	// contract. Those walk the chain, so any error that *wraps* a *gqlerror.Error anywhere inside
-	// it would be returned whole — and one line of ordinary-looking error handling,
-	// fmt.Errorf("insert into %s failed for tenant %d: %w", table, tenantID, gqlErr), would
-	// then ship the table name and the tenant id to the client. Unwrapping here makes redaction
-	// opt-*out*. gqlgen hands its own parse and validation errors to the presenter unwrapped,
-	// so the branch this exists for is unaffected.
-	if ge, ok := err.(*gqlerror.Error); ok { //nolint:errorlint // deliberate; see above
+	// A type assertion, not errors.As/errors.AsType. Those walk the chain, so any error that
+	// *wraps* a *gqlerror.Error anywhere inside it would be returned whole — and one line of
+	// ordinary-looking error handling, fmt.Errorf("insert into %s failed for tenant %d: %w",
+	// table, tenantID, gqlErr), would then ship the table name and the tenant id to the client.
+	// Unwrapping here makes redaction opt-*out*.
+	//
+	// No cause (Err, which Unwrap returns). gqlparser's formatting constructors — Errorf,
+	// ErrorPathf, ErrorPosf, ErrorLocf — and the validator's rule errors leave it nil; Wrap,
+	// WrapPath and WrapIfUnwrapped copy Message from err.Error() and set it. Drop this check and
+	// every driver error a resolver returns goes out verbatim, with no code and no log line, which
+	// is what luima did through 0.5.0. It keys on the cause, not on who wrote Message: a
+	// *gqlerror.Error with Err set is redacted even with a hand-written Message and its own
+	// extensions.code. The one error about the document that gqlparser wraps is redacted with it —
+	// a variable default that does not parse for a custom scalar ($t: Time = 99999999999999999999,
+	// validator.VariableValues) — and keeping its GRAPHQL_VALIDATION_FAILED code heard would mean
+	// trusting a code, which any extension registered through Configure can set.
+	//
+	// No field context. gqlgen reports everything it has to say about the request itself — parse,
+	// validation, variable coercion, complexity, luima's depth limit, a malformed body — through
+	// Executor.DispatchError, before any field runs. Everything presented with a field context in
+	// ctx came from resolving a field, and a missing cause proves nothing there: a gqlerror.List a
+	// resolver decoded from an upstream GraphQL response has none (Err is tagged json:"-"), nor
+	// does gqlerror.Errorf("%v", err), nor what a recover function returns for a resolver's panic.
+	// Drop this check and those go out verbatim, extensions and all. gqlgen's own text from that
+	// stage — "must not be null", "introspection disabled", a built-in scalar's unmarshalling
+	// error — is wrapped, so the cause check alone redacts it.
+	ge, isGQL := err.(*gqlerror.Error) //nolint:errorlint // deliberate; see above
+	if isGQL && ge.Unwrap() == nil && graphql.GetFieldContext(ctx) == nil {
 		return ge
 	}
 	// log.Printf on purpose. A Config.Logger field would be a second way to do what
@@ -139,13 +170,33 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	// the data withheld from the client above is written to stdout in full. That is deliberate,
 	// it is what makes an incident debuggable, and it means your log store inherits the
 	// database's confidentiality requirements. See SECURITY.md.
+	//
+	// When err is gqlgen's wrapper, %q renders it through (*gqlerror.Error).Error, which puts
+	// gqlparser's position in the client's document first: "input:1:2: ping ERROR #23505 ...".
+	// "input" is gqlparser's default source name, not a file of yours.
 	log.Printf("resolver error: %q", err)
-	redacted := gqlerror.WrapPath(graphql.GetPath(ctx), errors.New("internal server error"))
-	// Unconditional here, unlike the CustomError branch: this is the one error whose class the
-	// client can be told for free. The message says nothing, so the code says nothing either —
-	// it just spares every Apollo-shaped client a string comparison against "internal server
-	// error", which is the string this function most wants freedom to change.
-	redacted.Extensions = map[string]any{"code": "INTERNAL_SERVER_ERROR"}
+	redacted := &gqlerror.Error{
+		Message: "internal server error",
+		Path:    graphql.GetPath(ctx),
+		// Unconditional here, unlike the CustomError branch: this is the one error whose class the
+		// client can be told for free. The message says nothing, so the code says nothing
+		// either — it just spares every Apollo-shaped client a string comparison against
+		// "internal server error", which is the string this function most wants freedom to change.
+		Extensions: map[string]any{"code": "INTERNAL_SERVER_ERROR"},
+	}
+	// Redaction removes what went wrong, never where, and gqlgen has usually recorded where more
+	// precisely than ctx can: an argument that fails to unmarshal is wrapped on ping.at while ctx
+	// still reads ping, and only the wrapper carries locations. Both point into the client's own
+	// document, so they disclose nothing — provided they are this request's. ErrorOnPath and
+	// AddFieldLocationToError write them into an error in place the first time they report it, so
+	// an error value shared across requests arrives carrying the first request's alias and
+	// position. A path that does not extend ctx's is not this field's, and copying it could answer
+	// this client with another client's field names.
+	if isGQL && len(ge.Path) >= len(redacted.Path) &&
+		slices.Equal(ge.Path[:len(redacted.Path)], redacted.Path) {
+		redacted.Path = ge.Path
+		redacted.Locations = ge.Locations
+	}
 	return redacted
 }
 

@@ -72,12 +72,19 @@ transaction.
 **The error presenter redacts.** gqlgen's default presenter forwards `err.Error()` verbatim, which
 would hand an unauthenticated caller raw driver strings — `SQLSTATE 23505` and with it your table,
 column and constraint names. `luimaerr.PresentError` passes through only errors a resolver has
-explicitly marked safe (`*CustomError`) and gqlgen's own validation text about the query the
-client just sent; everything else is logged server-side and returned as `internal server error`.
+explicitly marked safe (`*CustomError`) and gqlgen's own text about the query the client just
+sent; everything else is logged server-side and returned as `internal server error`.
+
+It recognises gqlgen's text as a `*gqlerror.Error` that wraps no other error and was reported
+outside field resolution, and it needs both halves. gqlgen hands a resolver's plain error to the
+presenter wrapped in a `*gqlerror.Error` that carries `err.Error()` as its message, so the type
+proves nothing. And a resolver can return a `*gqlerror.Error` with no cause that it did not write —
+a list decoded from an upstream GraphQL response has none — so inside a field a missing cause
+proves nothing either. Through 0.5.0 both reached the client verbatim.
 
 This is damage control on information disclosure, not access control. Do not mistake it for one.
 
-Two limits worth stating plainly:
+Three limits worth stating plainly:
 
 - **It redacts on the wire, not in the log.** The redacted error is written to stdout in full, and
   a Postgres error's DETAIL field carries the offending row's values —
@@ -88,6 +95,10 @@ Two limits worth stating plainly:
   `&CustomError{UserMessage: err.Error()}` undoes the redaction in one line that reads like
   careful error handling. Treat it as untrusted too: the usual way to build it is from client
   input, so a client that renders error messages into the DOM inherits that sink.
+- **Any client can make it log.** Every redacted error writes a log line, and producing one takes
+  no resolver bug: a `__schema` query while introspection is disabled, a malformed value for a
+  custom scalar, or a variable default that does not parse is answered `INTERNAL_SERVER_ERROR` and
+  logged. Bound the volume, and do not page on that code alone.
 
 **Introspection and the playground are on by default.** Both are the right default for
 development and the wrong one for a public production endpoint. Set `DisablePlayground: true` and
@@ -201,11 +212,12 @@ Adding `transport.MultipartForm` through `Configure` removes all of that, and a 
 executes mutations with the caller's cookies. If you add it, add a required header with it —
 [gotcha #37](docs/gotchas.md#37-the-multipart-transport-is-a-csrf-hole) has the code.
 
-**Not every error is redacted, because not every error reaches the presenter.** A transport-level
-failure — a malformed JSON body, an unsupported content type — is written by gqlgen's transport
-before an executor exists, so `PresentError` never sees it and a malformed body is echoed back in
-the message. What is disclosed there is the caller's own bytes, not the server's, but do not treat
-"everything goes through `PresentError`" as a reason to skip sanitizing something.
+**Not every error is redacted, because not every error reaches the presenter.** A request no
+transport accepts — an unsupported content type — is answered `transport not supported` by gqlgen's
+handler, and the GET transport writes its own refusals; `PresentError` sees neither. A malformed
+JSON body does reach it, and passes through as gqlgen's own text with the body echoed back in the
+message. What is disclosed on these paths is the caller's own bytes, not the server's, but do not
+treat "everything goes through `PresentError`" as a reason to skip sanitizing something.
 
 With `sslmode` absent from your connection URL, `pg.ParseURL` returns
 `&tls.Config{InsecureSkipVerify: true}` — TLS is on, but the certificate is **not verified**. Use

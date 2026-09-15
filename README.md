@@ -464,8 +464,22 @@ func SQLState(err error) string
 `PresentError` applies these rules:
 
 - `*CustomError`, including when wrapped: sends `UserMessage` to the client.
-- A direct `*gqlerror.Error`: preserves gqlgen's parse or validation message.
+- A direct `*gqlerror.Error` that wraps no other error, reported outside field resolution:
+  preserves gqlgen's parse, validation or limit message.
 - Any other error: logs the error and sends `internal server error`.
+
+The last rule covers everything else reported while a field resolves, whatever its type: a
+resolver's or a directive's error, anything sent with `graphql.AddError` or `graphql.AddErrorf`, a
+panic, and a `*gqlerror.Error` built by your own code — `gqlerror.Errorf(...)`, or a list decoded
+from another GraphQL server. gqlgen wraps a resolver's plain error in a `*gqlerror.Error` before
+the presenter sees it, so the type alone proves nothing. The rule also covers gqlgen's own errors
+from that stage: a null where the schema forbids one, `introspection disabled` when
+`DisableIntrospection` is set, and a client's bad value for a custom scalar such as gqlgen's
+`Time`. A `*CustomError` is heard from a resolver, a directive or an `UnmarshalGQL` alike, so a
+scalar that should explain its format to the client has to be your own.
+
+Do not share one `*gqlerror.Error` value between requests. gqlgen writes the first request's path
+and locations into it, and two concurrent requests race on it.
 
 Treat `CustomError.UserMessage` as public data. Do not populate it with `err.Error()` or another
 database-derived string. `InternalError` remains available through `errors.Is` and `errors.As`.
@@ -480,11 +494,12 @@ object.
 | `NOT_FOUND` | `Update`, when no row matched |
 | `INTERNAL_SERVER_ERROR` | Every redacted error |
 | `DEPTH_LIMIT_EXCEEDED` | `MaxDepth` |
-| `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`, `COMPLEXITY_LIMIT_EXCEEDED` | gqlgen, passed through unchanged |
+| `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`, `COMPLEXITY_LIMIT_EXCEEDED` | gqlgen, passed through unchanged — except a variable default that does not parse for a custom scalar, which is redacted and still answered HTTP 422 |
 
-Transport-level failures — a malformed body, an unsupported content type — are written by gqlgen's
-transport before an executor exists. They never reach `PresentError`, carry no code, and are not
-redacted.
+Not every response goes through `PresentError`. A request no transport accepts, such as one with an
+unsupported content type, is answered `transport not supported` without it, and so are the GET
+transport's own refusals; neither carries a code. A malformed JSON body does reach it, and passes
+through with no code, quoting the caller's own body back.
 
 `SQLState` returns a PostgreSQL SQLSTATE from a wrapped go-pg error or an empty string when the
 chain contains no `pg.Error`. Common integrity codes are `23505` for a unique violation, `23503`

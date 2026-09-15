@@ -23,7 +23,7 @@ below expand the ones that need more than a row.
 | 13 | An empty list cannot clear an array column | `UpdateNotZero` skips zero values | `Update` — luima never calls `UpdateNotZero` |
 | 14 | Mutations answer with the value sent, not stored | No `RETURNING`; defaults, triggers and generated columns never seen | `Returning("*")` — luima does this ([below](#14-returning)) |
 | 15 | Empty list marshals as `null`, breaking `[T!]!` | A nil slice is not an empty slice | `crud.List` seeds `[]*T{}` |
-| 16 | A resolver's clear error message reads as "internal server error" | Returned a bare `error`; the presenter redacts it | Wrap in `*CustomError`, or use the crud helpers ([below](#16-resolvers-opt-in-to-being-heard)) |
+| 16 | A resolver's clear error message reads as "internal server error" | Returned anything but a `*CustomError` — a bare `error`, `gqlerror.Errorf` — and the presenter redacts it | Wrap in `*CustomError`, or use the crud helpers ([below](#16-resolvers-opt-in-to-being-heard)) |
 | 17 | *Every* schema typo reads as "internal server error" | Dropped the `*gqlerror.Error` branch from the presenter | Keep all three branches |
 | 18 | `DB *pg.DB` on `Resolver` disappears after generate | `layout: single-file` sets `HasRoot` and re-emits the bare struct | `layout: follow-schema` |
 | 19 | Helper functions vanish into a `/* !!! WARNING !!! */` block | `rewrite.RemainingSource` sweeps non-resolver declarations out of `*.resolvers.go` | Put helpers in `resolver.go` |
@@ -114,8 +114,24 @@ return nil, errors.New("user already exists")   // client sees: internal server 
 
 This is the design, not a bug. gqlgen's default presenter forwards `err.Error()` verbatim, which
 would hand an unauthenticated caller raw driver strings — `SQLSTATE 23505`, plus your constraint
-and column names. luima's presenter has three branches: `*CustomError` passes through,
-`*gqlerror.Error` passes through, everything else is logged server-side and redacted.
+and column names. luima's presenter has three branches: `*CustomError` passes through; a
+`*gqlerror.Error` that wraps no other error and was reported outside field resolution (gqlgen's
+parse, validation and limit errors) passes through; everything else is logged server-side and
+redacted.
+
+That last branch includes every `*gqlerror.Error` reported while a field resolves, and it has to.
+gqlgen wraps a resolver's plain error in one before the presenter sees it, copying `err.Error()`
+into the message, so a presenter that trusts the type sends the driver's text to the client. And a
+resolver can return one it did not write — a list decoded from an upstream GraphQL response has no
+cause — so a presenter that trusts a missing cause forwards whatever that server said. So
+`gqlerror.Errorf(...)` from a resolver or a directive is redacted too, and so is a panic, and so is
+everything sent with `graphql.AddError` or `graphql.AddErrorf` that is not a `*CustomError`.
+
+Two consequences read like bugs. With `DisableIntrospection` set, a `__schema` query is answered
+`internal server error` instead of gqlgen's `introspection disabled`. And a client's bad value for a
+custom scalar — `"yesterday"` for gqlgen's built-in `Time` — is answered the same way, because the
+presenter cannot tell gqlgen's unmarshalling text from yours. `UnmarshalGQL` can return a
+`*CustomError` and be heard, which for `Time` means binding a scalar of your own.
 
 ```go
 return nil, &luimaerr.CustomError{

@@ -61,11 +61,20 @@ fix. `tests/luimagen_test.go` still covers the exported surface from outside. `d
 ### The two load-bearing invariants
 
 1. **Error redaction is the design.** `luimaerr.PresentError` passes through `*CustomError` (the
-   resolver declared it safe) and `*gqlerror.Error` (gqlgen's own text about the client's query —
-   drop that branch and every schema typo reads as "internal server error"); everything else is
-   logged server-side and redacted. luima ships no auth, so this is the only thing between a caller
-   and your constraint and column names. This is *why* `crud/` exists — the helpers do the
-   classification so a resolver can't forget it.
+   resolver declared it safe) and a `*gqlerror.Error` that wraps nothing and was reported outside
+   field resolution (gqlgen's own text about the client's query — drop that branch and every
+   schema typo reads as "internal server error"); everything else is logged server-side and
+   redacted. luima ships no auth, so this is the only thing between a caller and your constraint
+   and column names. This is *why* `crud/` exists — the helpers do the classification so a
+   resolver can't forget it.
+
+   The type is not the check. gqlgen hands a resolver's plain error to the presenter already
+   wrapped in a `*gqlerror.Error` whose message is `err.Error()`, so matching on the type alone
+   sends driver text to the client — which every release through 0.5.0 did. `Unwrap() == nil`
+   rejects that wrapper, and `graphql.GetFieldContext(ctx) == nil` rejects a cause-less one a
+   resolver returns without having written it, such as a list decoded from an upstream GraphQL
+   response. `TestPresentErrorOverHTTP` pins both over HTTP, because a test that calls
+   `PresentError` directly only sees a wrapper it built itself.
 
 2. **`server.Mount` registers `r.All(endpoint, ...)`, never `r.Post`.** gqlgen's transports dispatch
    on method themselves, so GET, POST and the OPTIONS preflight must all reach the handler.

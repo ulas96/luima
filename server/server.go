@@ -69,6 +69,11 @@ type Config struct {
 	// validation errors (gqlparser/validator/core/helpers.go), and PresentError passes
 	// validation errors through by design, so a caller who guesses "nam" still learns there is
 	// a "name". Do not treat it as a substitute for authorization.
+	//
+	// With it set, a __schema or __type query is answered "internal server error" with
+	// INTERNAL_SERVER_ERROR, and logged. gqlgen reports "introspection disabled" as a plain error
+	// from resolving that field (ExecutionContextState.IntrospectSchema), and PresentError cannot
+	// tell it from a resolver's.
 	DisableIntrospection bool
 
 	// RequestTimeout @notice Deadline for the whole request, propagated into the resolver
@@ -216,11 +221,12 @@ type Config struct {
 	// returns nil, and so does the timeout middleware on both its normal and its timed-out
 	// path, so no resolver error ever becomes a Fiber error.
 	//
-	// ErrorPresenter is the only contract for errors a *resolver* returns. Transport-level
-	// failures — a malformed JSON body, an unsupported content type — are written by gqlgen's
-	// transport before any executor exists, so they never reach the presenter and are not
-	// redacted; a malformed body is echoed back in the message. Nothing sensitive of the
-	// server's is in that path, but the claim that everything goes through the presenter is
+	// ErrorPresenter is the only contract for errors a *resolver* returns. It does not see every
+	// error on the wire: a request no transport accepts, such as one with an unsupported content
+	// type, is answered "transport not supported" by handler.Server.ServeHTTP without it. A
+	// malformed JSON body does reach it, through Executor.DispatchError, and passes through as
+	// gqlgen's own text with the body echoed back in the message. Nothing sensitive of the
+	// server's is in either path, but the claim that everything goes through the presenter is
 	// not one to build on.
 	Fiber fiber.Config
 
