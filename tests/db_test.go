@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-pg/pg/v10"
+
 	"github.com/ulas96/luima/db"
 	"github.com/ulas96/luima/luimaerr"
 )
@@ -186,5 +188,43 @@ func TestStatementTimeout(t *testing.T) {
 	}
 	if state := luimaerr.SQLState(err); state != "57014" {
 		t.Errorf("SQLState(%v) = %q, want 57014 (query_canceled) — the bound has to be the server's", err, state)
+	}
+}
+
+// TestStatementTimeoutNegativeDisables @notice Asserts a negative StatementTimeout disables the
+// bound, as its @param says, rather than breaking every connection.
+//
+// @dev SKIPS without DATABASE_URL, like TestStatementTimeout: what goes wrong is Postgres refusing
+// the SET, and only a server can refuse it.
+//
+// Without the clamp, -1s reaches Postgres as "SET statement_timeout = -1000". The server rejects
+// that with SQLSTATE 22023 (invalid_parameter_value), OnConnect returns it, and go-pg removes the
+// connection it was initialising and hands the error to whatever query asked for one
+// (baseDB.getConn). The first such query is ConnectWith's own boot ping, so the call returns that
+// error instead of a pool. The first assertion is what fails when the clamp is removed.
+//
+// The second assertion is what "disables" means: SHOW reads 0, which is Postgres for no timeout.
+// A clamp to any other value — folding a negative d into the 1ms round-up, say — passes the first
+// assertion and fails this one.
+//
+// @param t the test handle
+func TestStatementTimeoutNegativeDisables(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set — skipping the negative statement_timeout round trip")
+	}
+
+	conn, err := db.ConnectWith(url, db.StatementTimeout(-time.Second))
+	if err != nil {
+		t.Fatalf("ConnectWith(StatementTimeout(-1s)) = %v, want a pool with the bound disabled", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	var got string
+	if _, err := conn.QueryOne(pg.Scan(&got), "show statement_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "0" {
+		t.Errorf("show statement_timeout = %q, want \"0\" — negative is documented as disabled", got)
 	}
 }

@@ -10,6 +10,20 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`db.StatementTimeout` with a negative duration disables the bound, as its doc has said since
+  `0.4.0`.** The duration reached Postgres unclamped — `-1s` as `SET statement_timeout = -1000` —
+  so `OnConnect` failed on every new pooled connection, `ConnectWith`'s own boot ping first.
+  Measured: `ping: ERROR #22023 -1000 ms is outside the valid range for parameter
+  "statement_timeout" (0 ms .. 2147483647 ms)`. A negative duration, documented as disabling the
+  bound, produced a `ConnectWith` that could only return an error; zero, the other documented
+  spelling, always worked, as did a negative duration shorter than a millisecond, which truncates
+  to zero. A negative duration is now clamped to `0`, which is Postgres for no timeout, and
+  `luima.StatementTimeout` picks the fix up through its wrapper. Nothing can have depended on the
+  old behaviour, since no connection configured that way could run a query. Only the lower end is
+  clamped: a duration above `2147483647ms`, about 24.8 days, is still refused the same way.
+
 ## [0.5.0] — 2026-08-27
 
 One call now scaffolds a table's CRUD layer. `luimagen.Generate` — and the `cmd/luimagen` binary

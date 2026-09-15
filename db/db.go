@@ -149,7 +149,13 @@ func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
 // The round-up is not tidiness. Milliseconds truncates, so any d under 1ms would reach Postgres as
 // "SET statement_timeout = 0" — which is Postgres for *no timeout at all*, turning a bound into
 // its own opposite silently. A zero or negative d still disables it, because that is what the
-// caller asked for.
+// caller asked for. The clamp to 0 is not tidiness either: Postgres accepts statement_timeout only
+// in 0 ms .. 2147483647 ms, so an unclamped -1s would reach it as "SET statement_timeout = -1000"
+// and be refused with SQLSTATE 22023. OnConnect returns that, and go-pg removes the connection it
+// was initialising and fails the query that asked for it (baseDB.getConn). OnConnect runs on every
+// new pooled connection, so every one would fail — ConnectWith's own boot ping first, which turns
+// the documented way to disable the bound into a ConnectWith that can only return an error. Only
+// the lower end is clamped: a d above 2147483647ms, about 24.8 days, is refused the same way.
 //
 // Overwrites any OnConnect already set; set yours after this one if you have both.
 //
@@ -157,7 +163,7 @@ func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
 // readable with luimaerr.SQLState). Zero or negative disables it.
 // @return func(*pg.Options) a tune func for ConnectWith
 func StatementTimeout(d time.Duration) func(*pg.Options) {
-	ms := d.Milliseconds()
+	ms := max(d.Milliseconds(), 0)
 	if d > 0 && ms == 0 {
 		ms = 1
 	}
