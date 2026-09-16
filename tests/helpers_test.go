@@ -10,11 +10,13 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/vektah/gqlparser/v2"
@@ -91,6 +93,89 @@ func newStubSchemaFunc(exec func(context.Context) *graphql.Response) graphql.Exe
 			Input: "type Query { ping: String }",
 		}),
 		exec: exec,
+	}
+}
+
+// newResolverStubSchema @notice A stub whose root fields are resolved through gqlgen's own
+// graphql.ResolveField — the function every generated field resolver calls.
+//
+// @dev An error test needs the input the presenter really gets, and newStubSchemaFunc cannot
+// produce it. A resolver's bare error is never handed over as returned: ResolveField passes it
+// through graphql.AddFieldLocationToError, graphql.AddError passes it through
+// graphql.ErrorOnPath, and between them it becomes a *gqlerror.Error. Build that wrapper by hand
+// instead and the test pins a rule against a guess at gqlgen's behaviour — which is how every
+// PresentError test stayed green while no resolver error was ever redacted.
+//
+// ping takes one argument, at: Time, and its field context is initialised the way generated code
+// initialises one (fieldContext_Query_*): graphql.ProcessArgField, gqlgen's own
+// graphql.UnmarshalTime wrapped by graphql.ErrorOnPath, and a failure reported with the field's
+// context. That is the route by which a client's bad scalar value reaches the presenter, on the
+// argument's path rather than the field's, and nothing else in this file produces it.
+//
+// @param resolve  the body of every root field, with a generated resolver's return shape
+// @return graphql.ExecutableSchema a schema with the single field `Query.ping(at: Time): String`
+func newResolverStubSchema(resolve func(context.Context) (any, error)) graphql.ExecutableSchema {
+	return newScalarStubSchema(resolve, graphql.UnmarshalTime)
+}
+
+// newScalarStubSchema @notice newResolverStubSchema, with at's unmarshalling supplied by the test.
+//
+// @dev The one route by which an UnmarshalGQL's error reaches the presenter is the argument's:
+// ProcessArgField extends the path with the argument's name, and ErrorOnPath wraps the error on it.
+// A scalar of the consumer's own is where a *luimaerr.CustomError comes from on that route.
+//
+// @param resolve    the body of every root field, with a generated resolver's return shape
+// @param unmarshal  what at's value goes through, in place of gqlgen's graphql.UnmarshalTime
+// @return graphql.ExecutableSchema a schema with the single field `Query.ping(at: Time): String`
+func newScalarStubSchema(resolve func(context.Context) (any, error), unmarshal func(any) (time.Time, error)) graphql.ExecutableSchema {
+	return stubSchema{
+		schema: gqlparser.MustLoadSchema(&ast.Source{
+			Name:  "resolver",
+			Input: "scalar Time type Query { ping(at: Time): String }",
+		}),
+		exec: func(ctx context.Context) *graphql.Response {
+			oc := graphql.GetOperationContext(ctx)
+			ctx = graphql.WithFieldContext(ctx, &graphql.FieldContext{Object: "Query"})
+
+			var data bytes.Buffer
+			data.WriteByte('{')
+			for i, field := range graphql.CollectFields(oc, oc.Operation.SelectionSet, []string{"Query"}) {
+				if i > 0 {
+					data.WriteByte(',')
+				}
+				graphql.MarshalString(field.Alias).MarshalGQL(&data)
+				data.WriteByte(':')
+				graphql.ResolveField(ctx, oc, field,
+					func(ctx context.Context, field graphql.CollectedField) (*graphql.FieldContext, error) {
+						fc := &graphql.FieldContext{Object: "Query", Field: field, IsMethod: true, IsResolver: true}
+						ctx = graphql.WithFieldContext(ctx, fc)
+						at, err := graphql.ProcessArgField(ctx, field.ArgumentMap(oc.Variables), "at",
+							func(ctx context.Context, v any) (*time.Time, error) {
+								if v == nil {
+									return nil, nil
+								}
+								res, err := unmarshal(v)
+								return &res, graphql.ErrorOnPath(ctx, err)
+							})
+						if err != nil {
+							oc.Error(ctx, err)
+							return fc, err
+						}
+						fc.Args = map[string]any{"at": at}
+						return fc, nil
+					},
+					resolve,
+					nil,
+					func(_ context.Context, _ ast.SelectionSet, v string) graphql.Marshaler {
+						return graphql.MarshalString(v)
+					},
+					true,  // recoverFromPanic, as generated code passes it
+					false, // nonNull: ping is String, not String!
+				).MarshalGQL(&data)
+			}
+			data.WriteByte('}')
+			return &graphql.Response{Data: data.Bytes()}
+		},
 	}
 }
 

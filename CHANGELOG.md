@@ -10,6 +10,330 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+luima runs on bun now, so nothing that names a go-pg type compiles until it is re-typed. The
+compiler finds every one of those, and the migration list below is the mapping. It does not find the
+two that matter most: a model's table name moves from an unexported `tableName` field to an embedded
+`bun.BaseModel`, which compiles and then queries a different table, and a zero-valued field is now
+stored as its zero value where go-pg sent `DEFAULT` or `NULL`. Read both before deploying this
+against a table that already holds rows.
+
+### Changed
+
+- **luima runs on bun `v1.2.18` — `bun`, `dialect/pgdialect` and `driver/pgdriver` — where every
+  release through `0.5.0` ran on go-pg `v10`.** luima's signatures named go-pg's types, so this
+  breaks the public API, and the break is kept to exactly what the switch forces: every function
+  keeps its name, its parameters' meaning and its absence contract, `server/` is unchanged, and
+  `crud` still classifies 23505 as `CONFLICT` and a missing row as `NOT_FOUND` or `(nil, nil)`.
+
+  pgdriver rather than pgx, for the least drift: the same TLS posture when `sslmode` is absent, the
+  same `connect_timeout` and `application_name`, and an error value that still carries the Postgres
+  error fields `SQLState` reads. Its costs are the runtime notes below, and they are real.
+
+  **Migration**, one line per break:
+
+  - `*pg.DB` → `*bun.DB` — what `Connect` and `ConnectWith` return, and what your `Resolver` holds.
+  - `orm.DB` → `bun.IDB` in all five CRUD helpers. `*bun.DB`, `bun.Conn` and `bun.Tx` satisfy it,
+    and the last two have value receivers, so pass `tx`, not `&tx`.
+  - One option-closure type per statement, in place of the single `func(*orm.Query) *orm.Query`:
+    `func(*bun.SelectQuery) *bun.SelectQuery` for `Get` and `List`, `*bun.InsertQuery` for
+    `Create`, `*bun.UpdateQuery` for `Update`, `*bun.DeleteQuery` for `Delete`. bun builds each
+    statement with its own type, and the interface three of them share, `bun.QueryBuilder`, reaches
+    only the WHERE clause — so a predicate wanted by more than one is written once as a
+    `func(bun.QueryBuilder) bun.QueryBuilder` and passed through `ApplyQueryBuilder`, which the
+    select, update and delete queries all have. One option type for all five would have to be a
+    wrapper over bun, which is the thing this package refuses to be.
+  - `q.OnConflict("DO NOTHING")` → `q.On("CONFLICT DO NOTHING")`;
+    `db.RunInTransaction(ctx, func(tx *pg.Tx) error)` →
+    `db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error)`; `db.AddQueryHook(h)` →
+    `db.WithQueryHook(h)`, which returns a copy of the handle over the same pool rather than
+    mutating it (`AddQueryHook` still exists, marked deprecated upstream); and `pg.Ident`/`pg.Safe`
+    → `bun.Ident`/`bun.Safe`, the identifier and vetted-fragment wrappers `docs/gotchas.md` #31
+    tells you to reach for.
+  - `q.UpdateNotZero()` is the one that is **not** a rename. go-pg's was a terminal executor —
+    `UpdateNotZero(scan ...interface{}) (Result, error)` — so no `crud.Update` option can ever have
+    held it; bun's `q.OmitZero()` returns the query, so one now can, and raw go-pg code that swaps
+    one spelling for the other builds a statement nobody runs. `Update` still does not apply it
+    itself: skipping zero-valued fields means an empty string cannot clear a text column, and
+    `false` or `0` cannot be written at all — a data-retention bug wearing a partial-update
+    feature's clothes. `q.Column(…)` is the escape hatch that names what it narrows.
+  - `pg.ErrNoRows` → `sql.ErrNoRows`, and only for a single-row `Scan`. `Create` and `Update` `Exec`
+    their `RETURNING *` with no destination, and `(*baseQuery)._scan` raises the error only when it
+    has one — so an insert `ON CONFLICT DO NOTHING` or a `BEFORE INSERT` trigger suppressed, and an
+    update that matched no row, are now `RowsAffected() == 0` with a nil error. luima's helpers keep
+    their contract, `(nil, nil)` and `NOT_FOUND`; a hand-written query that branches on `ErrNoRows`
+    after an insert or an update compiles after the rename and then never fires again.
+    `docs/gotchas.md` #10.
+  - `pg:"…"` struct tags → `bun:"…"`. Column names are unaffected: bun's `internal.Underscore` is
+    byte-identical to go-pg's, so an untagged field still derives the same column. `,pk` and
+    `,array` carry over as written. `,use_zero` has no bun spelling, because it is bun's behaviour
+    now — leave it in place and bun prints one `has unknown tag option: "use_zero"` WARN per field
+    the first time it builds that model's table. `discard_unknown_columns` on the table tag has no
+    bun spelling either, and only WARNs: bun reads that switch from the `*bun.DB`, and
+    `ConnectWith` now builds every handle with `bun.WithDiscardUnknownColumns()`, so a column your
+    model does not declare is ignored for every model. Without it, `RETURNING *` in `Create` and
+    `Update` failed the scan with `bun: T does not have column` after the statement had committed —
+    a stored row answered as an error, and the client's retry answered `CONFLICT`.
+  - **`tableName struct{}` `pg:"app_users"` → an embedded `bun.BaseModel` tagged
+    `bun:"table:app_users"`. This is the one that fails quietly.** bun reads the table name from
+    the embedded `BaseModel` and from nowhere else, and it skips every unexported field that is not
+    embedded without a word (`(*schema.Table).processFields`) — so a model that keeps the go-pg
+    spelling still compiles, and every statement then goes to the pluralized type name: `users`,
+    not `app_users`. Where no such table exists the helpers fail with an error `PresentError`
+    redacts; where one does exist, they succeed against the wrong table. `docs/gotchas.md` #38 has
+    the one-line check that needs no database.
+  - `ConnectWith`'s tune func and `StatementTimeout`'s return value are now `func(*pgdriver.Config)`
+    in place of `func(*pg.Options)`. `StatementTimeout` still sends the same `SET`: pgdriver has no
+    `OnConnect` hook, so it merges one key into `Config.ConnParams`, which `newConn` sends as
+    `SET statement_timeout TO <ms>` on every connection it opens.
+  - `HealthCheck: db.Ping` → `HealthCheck: db.PingContext`. `*bun.DB` embeds `*sql.DB` through its
+    state struct, and its `Ping` takes no context, so the old spelling no longer compiles — which is
+    the good outcome: it would have run on `context.Background()` and ignored the 2s deadline
+    `Health` gives the probe.
+  - `luimaerr.SQLState` reads `pgdriver.Error`, and that type is a struct **value** — `readError`
+    builds it as `Error{m: m}`, nothing takes its address, and every method has a value receiver.
+    `errors.AsType[*pgdriver.Error]` (or `var e *pgdriver.Error; errors.As(err, &e)`) compiles and
+    never matches, so every SQLSTATE branch behind it is dead code that reads as correct. This is
+    the inverse of the trap `pg.Error` set, where the same `*` failed to compile, and it is the
+    spelling someone arriving from pgx writes, because `*pgconn.PgError` is a pointer.
+  - `luimagen`'s `checkTag` now rejects `,` and `:` in `Options.Table` and `Field.Column`, where
+    before it checked only what `%q` escapes. Both bytes are separators in bun's tag grammar
+    (`internal/tagparser`), and a name holding one is read back short with nothing but a `WARN`
+    about the option left over: `bun:"pro,jects,array"` binds the column `pro`, and
+    `bun:"table:ten,ant"` selects `FROM "ten"`. A `:` in the tag's name half opens an option
+    instead, so `Tag.Name` comes back empty and `(*schema.Table).newField` binds its own
+    `Underscore(sf.Name)` — the same one-line WARN, and nothing at all about the name substituted
+    for the one you wrote. A schema-qualified `tenant.users` is still accepted and still renders
+    `"tenant"."users"`.
+  - `luimagen`'s generated model changes shape with everything else: the file now opens with
+    `import "github.com/uptrace/bun"` and embeds `bun.BaseModel` tagged `bun:"table:…"` where it
+    used to write an unexported `tableName struct{}`, and the `List` resolver it patches in takes a
+    `func(q *bun.SelectQuery) *bun.SelectQuery`. Regenerate and the files differ; `writeModel` still
+    refuses to overwrite a model you have since hand-edited. A field named `BaseModel` is refused
+    before anything is written, because the embedded `bun.BaseModel` already takes that name.
+  - Your own `go.mod` swaps `github.com/go-pg/pg/v10` for `github.com/uptrace/bun`, plus
+    `driver/pgdriver` wherever you name `ConnectWith`'s tune type. The graph gains
+    `go.opentelemetry.io/otel` indirectly as well, because pgdriver sets `EnableTracing: true` in
+    `newDefaultConfig`, and with it `(*Conn).trace` adds `db.user`, `db.name` and `server.address`
+    to whatever span is already recording in a query's context. It starts no span of its own —
+    per-statement spans are `bunotel`'s job — and `c.EnableTracing = false` in a `ConnectWith` tune
+    turns even the attributes off. It is not a DSN parameter: `?tracing=false` would become a `SET`
+    and fail 42704.
+
+- **Stored data changes shape: bun writes a zero-valued field as that zero value.** go-pg sent
+  `DEFAULT` on insert and `NULL` on update for anything zero unless the field was tagged
+  `,use_zero`; bun sends the empty string, `0`, `FALSE` or the zero time, and reaches for `DEFAULT`
+  only when the field is a nil pointer, or is zero *and* tagged `,nullzero` or `default:`
+  (`(*InsertQuery).marshalsToDefault`, `(*schema.Field).appendValue`). On an UPDATE that `DEFAULT`
+  is the column's own default, so it is `NULL` only for a column that has none. Four consequences
+  worth reading before you deploy this against an existing table — `docs/gotchas.md` #27 has the
+  tag-by-tag table:
+
+  - A column with a `DEFAULT now()` that your input mapper leaves zero is now stored as the zero
+    time rather than filled in by Postgres. Tag it `,nullzero`, or make the field a pointer.
+  - An identity or serial key wants `,autoincrement`; `,identity` alone still sends `0`, so the
+    first `Create` stores `0` and the second fails 23505 — reaching the client as a `CONFLICT` over
+    a key it never chose. A `GENERATED ALWAYS AS IDENTITY` key does not even get that far: Postgres
+    accepts only `DEFAULT` for one, so the literal `0` is refused **428C9** and every `Create`
+    fails.
+  - **A generated column has the same shape and is easier to miss**, because nothing about it looks
+    like a key: Postgres takes `DEFAULT` there and nothing else, so a field bun sends as `''` or `0`
+    refuses every insert with 428C9 too. Tag it `,scanonly`, which keeps it out of the INSERT while
+    `RETURNING *` still reads the computed value back. Both 428C9s reach the client as
+    `internal server error`, because `PresentError` redacts them — where go-pg's zero → `DEFAULT`
+    made both table shapes work without a tag.
+  - **A nil `,array` slice is written as a literal `NULL`, on insert and on update alike**
+    (pgdialect's `appendStringSlice`), and a `NULL` is a value, so the column's `DEFAULT` never
+    applies: a nil `[]string` into `projects text[] not null default '{}'` is now **23502**, which
+    `PresentError` redacts to `internal server error`. This is not only models built in Go. gqlgen
+    hands a resolver a nil slice for a **nullable** list — a `[String!]` argument that is null or
+    omitted generates `if v == nil { return nil, nil }` ahead of the loop (`codegen/type.gotpl`) —
+    and only a non-null `[String!]!` is guaranteed non-nil, because there the generated
+    unmarshaller is `make([]string, len(vSlice))`. Send `[]string{}`, which still writes `'{}'` and
+    still clears the column, or tag the field `,nullzero`. `docs/gotchas.md` #39.
+
+  `,nullzero` is how to ask for go-pg's old shape, field by field. Adding it wholesale is not
+  recommended and is not what luima's own models do: it makes an empty string, a `0` and a `false`
+  unwritable, which is a silent data-retention bug rather than a partial-update feature.
+
+- **Query cancellation reaches only the client now, so `statement_timeout` is the only bound
+  Postgres enforces.** go-pg answered a cancelled context by dialing a second connection and
+  sending a Postgres CancelRequest. pgdriver sends none — it reads the backend key at startup and
+  never uses it — so `RequestTimeout`, or any context deadline, becomes a socket deadline
+  (`(*Conn).deadline`), the read fails, pgdriver closes the connection, and the statement runs on
+  in Postgres until it finishes, holding its backend and its locks. `luima.StatementTimeout(d)`, or
+  `?statement_timeout=` in the DSN, is what the server enforces whether or not the client is still
+  there. When it fires Postgres answers 57014 and pgdriver returns that error unchanged, so
+  `SQLState` still reads it — but the pooled connection may not survive: `checkBadConn` counts
+  57014 as a bad connection, and it runs in `ExecContext` and `QueryContext`, so a 57014 raised
+  before a query's row description costs the pool that connection while one raised during row
+  iteration does not. `docs/gotchas.md` #40, and `SECURITY.md` for what a deadline still buys.
+
+- **`Connect` keeps pgdriver's socket timeouts — `ReadTimeout` 10s, `WriteTimeout` 5s
+  (`newDefaultConfig`) — and they are a ceiling on every statement.** They are the only bound on
+  the I/O pgdriver does without the caller's context: the rows after a query's row description,
+  the drain in `rows.Close`, COMMIT and ROLLBACK, and the startup of every connection
+  `database/sql` dials in its background opener. Zeroing them would leave all of that unbounded
+  against a server that stops answering. What they cost: a statement whose reply takes longer than
+  10s fails client-side with an i/o timeout whatever `RequestTimeout` allows, and a
+  `statement_timeout` at or above 10s means the caller gets that i/o timeout with no SQLSTATE
+  instead of a readable 57014. Raise the read bound with `?read_timeout=60s` or a `ConnectWith`
+  tune setting `c.ReadTimeout`, and keep `statement_timeout` under both it and `RequestTimeout` —
+  that is why the quickstart's own `StatementTimeout` drops from 10s to 5s in this release.
+
+- **The DSN accepts far more than it used to, and rejects far less.** pgdriver's `parseDSN` reads
+  `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `application_name`, `connect_timeout`,
+  `dial_timeout`, `timeout`, `read_timeout`, `write_timeout` and `host` — `sslcert` and `sslkey`
+  only alongside `sslmode` or `sslrootcert`, and only as a pair; **every other parameter
+  becomes `SET <name> TO <value>` on each new connection**, where `pg.ParseURL` knew three and
+  made anything else a parse error. So `?statement_timeout=5s` now works — and a misspelled name
+  is no longer caught while parsing: it fails `Connect`'s boot round trip instead, as 42704 for an
+  unknown setting, or 42601 for a key such as `a-b`, or never at all for a dotted name such as
+  `app.x`, which Postgres takes as a custom setting. Two names are refused while parsing, in any
+  case: `?password=` and `?sslpassword=`, which libpq reads and pgdriver does not — sent as a `SET`,
+  Postgres rejects the statement and, at the default `log_min_error_statement`, logs it with the
+  value in it. A timeout written as a plain integer `0` or less still means the default, as
+  `pg.ParseURL` read `?connect_timeout=0`: pgdriver's `(*queryOptions).duration` answers `-1`, a
+  deadline already passed, and `Connect` puts pgdriver's default back. `$PGPASSWORD` still fills a
+  DSN with no password — `Connect` reads it, since pgdriver does not — but there is no further
+  fallback to `postgres`, as go-pg had. One more silence to know about: a DSN with no database name
+  connects to `$PGDATABASE`, then `postgres`, where the old parser refused it. Set `application_name` and check `pg_stat_activity` if you want to see which
+  database and user you actually got. `docs/deployment.md` walks the whole DSN.
+
+- **`?sslmode=verify-ca` still verifies the host name, though pgdriver's does not.** go-pg treated
+  `verify-ca` as `verify-full`; pgdriver implements libpq's meaning, a `VerifyPeerCertificate` that
+  checks the chain and deliberately not the DNS name, and uses it for `?sslmode=require` with an
+  `sslrootcert` too. `Connect` hands both back to crypto/tls's full check, so a `verify-ca` DSN
+  carried over is not quietly weaker, and `require` with an `sslrootcert` — which `0.5.0` refused —
+  verifies as much. A chain-only check is a `VerifyConnection` of your own in a `ConnectWith` tune.
+  `docs/deployment.md` has the mode table.
+
+- **The pool is `database/sql`'s, and `Connect` sizes it.** `database/sql` defaults to unlimited
+  open connections and two idle (`defaultMaxIdleConns`), which turns a burst of requests into a
+  burst of connections and, past `max_connections`, into 53300 for every client of that server.
+  `Connect` sets `SetMaxOpenConns` and `SetMaxIdleConns` to `10 * runtime.NumCPU()` and
+  `SetConnMaxIdleTime` to 5 minutes — the sizing `0.5.0` ran with, its driver's defaults. Resize it
+  on the returned handle: `*bun.DB` embeds `*sql.DB` through its state struct, so those setters and
+  `Stats` are promoted to it. There is no pool-wait timeout any more; the wait is bounded by the
+  caller's context.
+
+- **`db.Connect` no longer panics, and refuses a DSN whose user info ends early.**
+  `pgdriver.WithDSN` panics on any parse failure, and `parseDSN` builds its options as it goes, so
+  `postgres://:secret@host/db` and `postgres://@host/db` panic out of `WithUser` — a panic skips
+  the caller's error handling and prints the unredacted parse error on the way out. Both now come
+  back as an error. Separately, a DSN whose user info an unescaped `/`, `?` or `#` cuts short is
+  refused before anything dials, because pgdriver would otherwise dial part of the password and
+  name it in the dial error: `postgres://app:p@ss/x@db/app` parses as the user `app` with the
+  password `p` against the host `ss`, and `postgres://127.0.0.1:2024#x@db/app` as no user info at
+  all against `127.0.0.1:2024`, where `2024` is where the password started. `0.5.0` happened to
+  refuse the `?` and `#` shapes, because they leave the path empty and `pg.ParseURL` answered
+  `database name not provided`; it accepted the `/` shape, and pgdriver defaults a missing database
+  anyway. The tell is an `@` outside the authority, and it is looked for in the path, in the
+  fragment, and in the query only as far as its first `=` — past that is a parameter's value, where
+  an `@` is the operator's: `?application_name=api@prod` is well formed and is left alone. What
+  still gets through is a password like `2024?a=b`, an `=` before the `@` with a digits-only prefix
+  for `url.Parse` to read as the port. **Migration:** percent-encode `/ ? # %` in the user or
+  password, and write any `@` past the host as `%40` — except in a parameter's value, which needs
+  no encoding.
+
+### Removed
+
+- **luima's TLS `ServerName` fill.** `db.Connect` used to set `TLSConfig.ServerName` from the URL's
+  host for `sslmode=verify-full`, because go-pg left it empty and `crypto/tls` verifies no host
+  name without it. pgdriver sets it itself, from the authority with its port stripped, for
+  `verify-full`, `verify-ca` and `require` alike — so the fill is now dead code over a value
+  pgdriver already wrote. `TestConnectVerifyFull` stays, as a regression guard on that. One
+  case the fill never had to cover, because `pg.ParseURL` refused every parameter but its three: a
+  host given only as `?host=`, which pgdriver reads and which leaves the URL's authority — and so
+  `ServerName` — empty, making `crypto/tls` refuse every `verify-full` handshake. Set
+  `c.TLSConfig.ServerName` in a `ConnectWith` tune for that one.
+
+### Fixed
+
+- **`db.StatementTimeout` with a negative duration disables the bound, as its doc has said since
+  `0.4.0`.** The duration reached Postgres unclamped — `-1s` as `SET statement_timeout = -1000` —
+  so the `SET` failed on every new pooled connection, `ConnectWith`'s own boot ping first. It was
+  `pg.Options.OnConnect` that ran it in `0.5.0`, where this was measured, and it is
+  `Config.ConnParams` under pgdriver; the bug is the same either way. Measured against `0.5.0`, in
+  go-pg's rendering: `ping: ERROR #22023 -1000 ms is outside the valid range for parameter
+  "statement_timeout" (0 ms .. 2147483647 ms)`. A negative duration, documented as disabling the
+  bound, produced a `ConnectWith` that could only return an error; zero, the other documented
+  spelling, always worked, as did a negative duration shorter than a millisecond, which truncates
+  to zero. A negative duration is now clamped to `0`, which is Postgres for no timeout, and
+  `luima.StatementTimeout` picks the fix up through its wrapper. Nothing can have depended on the
+  old behaviour, since no connection configured that way could run a query. Only the lower end is
+  clamped: a duration above `2147483647ms`, about 24.8 days, is still refused the same way — as
+  pgdriver renders it now, `ERROR: … (SQLSTATE=22023)`.
+
+### Security
+
+- **`luimaerr.PresentError` now redacts what resolvers report — it never did.** gqlgen does not
+  hand the presenter a resolver's error as returned: `graphql.ResolveField` passes it through
+  `graphql.AddFieldLocationToError`, `graphql.AddError` passes it through `graphql.ErrorOnPath`,
+  and both wrap an error that holds no `*gqlerror.Error` in one whose message is `err.Error()`
+  verbatim. The pass-through meant for gqlgen's own errors matched any top-level
+  `*gqlerror.Error`, so in every release so far a bare driver error — `relation "app_users" does
+  not exist`, a constraint name — reached the client as written, with no `extensions.code` and no
+  log line, while every test that called `PresentError` directly passed. A `*gqlerror.Error` now
+  passes through only if it wraps no other error and was reported outside field resolution, which
+  is how gqlgen reports parse, validation, variable and complexity errors and a malformed body, and
+  how luima reports its depth limit. Anything else that is not a `*CustomError` is logged and
+  answered `internal server error` with `INTERNAL_SERVER_ERROR`, keeping its `path` and
+  `locations` when they belong to the request being answered.
+
+  Clients now get that answer, where they used to get the error's own text, for: an error returned
+  by a resolver, a field directive or `AroundFields` middleware, or by an argument directive;
+  anything sent with `graphql.AddError` or `graphql.AddErrorf` while a field resolves; every
+  `*gqlerror.Error` reported while a field resolves, with or without a cause, its own `extensions`
+  included — `gqlerror.Errorf(...)`, one built by hand, a `gqlerror.List` decoded from an upstream
+  GraphQL response; a resolver panic, whether gqlgen's default recover function answers it (its
+  `internal system error` carried no code) or one installed with `SetRecoverFunc` does; gqlgen's
+  null violations (`must not be null`, `the requested element is null which the schema does not
+  allow`); a client's bad value for a custom scalar, gqlgen's built-in `Time` included; and a
+  variable default that does not parse for a custom scalar, which is still answered HTTP 422 but
+  with `INTERNAL_SERVER_ERROR` in place of `GRAPHQL_VALIDATION_FAILED`. Each of these also writes a
+  `resolver error` log line, so any client that can send a bad `Time` can produce one at will, and
+  an alert keyed on `INTERNAL_SERVER_ERROR` sees it. gqlgen's own `introspection disabled` would be
+  on this list, which is why `DisableIntrospection` no longer reaches it — see the next entry.
+
+  The `path` and `locations` on that answer, and on a `*CustomError`'s, are the request's own: the
+  field's path, extended only into one of that field's arguments — which is how gqlgen reports a
+  bad argument, on `ping.at` while the field is `ping` — and the field's own position in the
+  document. They are never copied from the error value, because gqlgen writes both into a
+  `*gqlerror.Error` in place, so a value shared across requests carries the first request's
+  aliases, including a child field's. A `*CustomError` gains `locations` on the wire with this, and
+  one returned from an `UnmarshalGQL` is heard on the argument's path.
+
+  **Migration:** send a message meant for the client as a `*luimaerr.CustomError`, whose `Code`
+  becomes `extensions.code`. It is heard from a resolver, a directive, a recover function or an
+  `UnmarshalGQL` alike, through gqlgen's wrapper, so a scalar that should explain its format to the
+  client has to be your own rather than gqlgen's built-in binding. Do not share one
+  `*gqlerror.Error` value between requests: gqlgen writes the first request's path and locations
+  into it.
+
+- **`DisableIntrospection` refuses the operation, before any field runs.** A `__schema` or `__type`
+  selection anywhere in the document, a fragment included, is answered `introspection is disabled`
+  with `extensions.code` `INTROSPECTION_DISABLED`, HTTP 200, and no log line — the shape of a depth
+  rejection. It used to reach gqlgen's field-level gate, whose plain `introspection disabled` the
+  entry above redacts and logs, so one unauthenticated query wrote a log line and moved an
+  error-rate alert. gqlgen's gate still stands behind the new check.
+
+- **`db.Connect`'s parse error could carry the start of the password.** `0.2.0` dropped the raw DSN
+  from that error by keeping only the `*url.Error`'s `Op` and `Err`, and the narrower leak survived
+  every release through `0.5.0`: `Err` quotes the text `url.Parse` rejected, and an unescaped `/`,
+  `?` or `#` in a password ends the URL's authority early, so the port it names is where the
+  password started — `postgres://app:Xk9/Q@db/app` came back as
+  `parse database url: parse: invalid port ":Xk9" after host`. The call site logs it; the
+  quickstart calls `log.Fatal` on it, which writes a live credential to stderr and into whatever
+  ships stderr onward. Every error `Connect` now returns is scrubbed instead. The `*url.Error`
+  branch keeps `Op` and replaces every quoted fragment of `Err` — `%q`, and `strconv.Quote` in
+  `EscapeError`, `InvalidHostError` and netip's `ParseAddr` error — then names the usual cause, so
+  the diagnosis survives without the text. Every other error has the DSN replaced wherever it
+  occurs, and is withheld whole if the decoded password still occurs in what is left, because a
+  marker at each occurrence of a short password spells the password out. Neither branch wraps the
+  original with `%w`, since anything walking the chain would print what was removed.
+  `TestConnectRedactsDSN` and `TestConnectNeverPanicsOrLeaks` pin it, the second over thirteen
+  malformed DSNs plus a password short enough to occur in pgdriver's own wording.
+
 ## [0.5.0] — 2026-08-27
 
 One call now scaffolds a table's CRUD layer. `luimagen.Generate` — and the `cmd/luimagen` binary
@@ -68,7 +392,7 @@ thing this release asks of an existing consumer is a Go 1.27 toolchain.
   view is not luimagen's to report.
 
   **luimagen reads the names gqlgen generated rather than predicting them.** gqlgen runs SDL names
-  through `templates.ToGo`, which re-capitalizes 24 common initialisms, so `Field{Name: "OwnerId"}`
+  through `templates.ToGo`, which re-capitalizes the common initialisms, so `Field{Name: "OwnerId"}`
   comes back as `UserInput.OwnerID` and `Type: "URL"` comes back as the resolver method `URl`.
   Resolver methods are matched case-insensitively (for a delimiter-free name `ToGo` only re-cases,
   never changes letters, so this is exact), and so is the lookup for the generated input struct

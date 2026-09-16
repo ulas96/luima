@@ -37,11 +37,34 @@ import (
 func main() {
 	dev := os.Getenv("LUIMA_DEV") != ""
 
-	// ConnectWith rather than Connect for the one thing a DSN cannot say. RequestTimeout bounds
-	// the resolver's context and go-pg turns that into a Postgres CancelRequest, but that cancel
-	// is best-effort — it dials a second connection and only logs a failure. statement_timeout is
-	// the bound the server enforces whether or not the client is still there.
-	db, err := luima.ConnectWith(os.Getenv("DATABASE_URL"), luima.StatementTimeout(10*time.Second))
+	// ConnectWith rather than Connect, for the only query bound Postgres enforces itself.
+	// RequestTimeout puts a deadline on the resolver's context and pgdriver turns it into a socket
+	// deadline ((*Conn).deadline), but pgdriver never sends a Postgres CancelRequest — so that
+	// deadline stops the client waiting and nothing else: the statement runs on in Postgres until
+	// it finishes, holding its backend and its locks. statement_timeout is what the server enforces
+	// whether or not the client is still there.
+	//
+	// The DSN could carry it — ?statement_timeout=5s works now, because pgdriver sends every
+	// parameter it does not recognize as SET name TO value on each new connection (newConn). It
+	// stays here because it is the application's bound rather than the deployment's: a value
+	// computed in Go, reviewed in the same diff as the resolvers it protects, instead of a substring
+	// of DATABASE_URL that a new environment can drop with nothing failing. StatementTimeout merges
+	// into ConnParams after the DSN is parsed, so this wins over a DSN that sets it too.
+	//
+	// 5s, not 10s, because the bound has to sit under both client-side deadlines or its SQLSTATE
+	// never arrives. The read waiting for the answer gives up at the earlier of pgdriver's 10s
+	// ReadTimeout and this request's deadline — RequestTimeout, left at its 15s default below — and
+	// the caller then gets an i/o timeout with no SQLSTATE, on a connection pgdriver closes: the
+	// statement is still bounded in Postgres, but nothing on this side can tell that is what
+	// bounded it. At 5s the 57014 arrives first, so the server's log line ends "(SQLSTATE=57014)"
+	// and luimaerr.SQLState can classify it — which is what a resolver needs to answer a timeout
+	// with a *CustomError of its own. What the client sees is the same either way: crud turns 23505
+	// into a CustomError and nothing else, so both timeouts present as "internal server error".
+	//
+	// Raise ReadTimeout in a tune func if you raise this — and RequestTimeout below with it, once
+	// the bound goes past its 15s default, or the request deadline becomes the earlier one and
+	// raising ReadTimeout alone changes nothing.
+	db, err := luima.ConnectWith(os.Getenv("DATABASE_URL"), luima.StatementTimeout(5*time.Second))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,10 +86,13 @@ func main() {
 
 		// The path an orchestrator probes. It is not wrapped by HTTPMiddleware, so the rate
 		// limiter below cannot 429 the probe and take a healthy-but-busy process out of rotation.
-		// db.Ping already has the signature this field wants, and the context it gets carries a 2s
-		// deadline of its own — a probe that hangs reads as a slow server rather than a broken one.
+		// *bun.DB embeds *sql.DB through its state struct, so db.PingContext already has the
+		// signature this field wants, and the context it gets carries a 2s deadline of its own — a
+		// probe that hangs reads as a slow server rather than a broken one. PingContext, not Ping:
+		// Ping takes no context, so it does not compile here, and would have run on
+		// context.Background() and ignored that deadline.
 		Health:      "/healthz",
-		HealthCheck: db.Ping,
+		HealthCheck: db.PingContext,
 
 		// HTTPMiddleware is the seam for anything that needs the real *http.Request, and it is
 		// where every cross-cutting concern belongs — not on the app. A Fiber handler cannot reach

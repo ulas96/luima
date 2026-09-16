@@ -23,9 +23,9 @@ type Field struct {
 	Name string // Go field name, e.g. "PersonalID"
 	Type string // Go type as it should appear in the generated struct: string, int, float64, bool, or a slice of one of those, e.g. "[]string"
 	PK   bool   // true for exactly one field
-	// Column is the SQL column name; default snakeCase(Name), which is go-pg's own convention.
+	// Column is the SQL column name; default snakeCase(Name), which is bun's own convention.
 	// Set it when the table's column is not what that derives — most often a run of capitals with
-	// no lower-case neighbour, where go-pg's rule inserts no separator at all: URLID becomes
+	// no lower-case neighbour, where bun's rule inserts no separator at all: URLID becomes
 	// urlid, and the column is almost certainly url_id. luimagen does not create the table, so a
 	// derived name that disagrees with it compiles fine and fails on the first query.
 	Column string

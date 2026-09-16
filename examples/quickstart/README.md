@@ -50,7 +50,7 @@ Run it twice and the second one answers `"user E-1042 already exists"` — not a
 | file | who writes it |
 |---|---|
 | `graph/schema.graphqls` | you — the source of truth |
-| `graph/model/user.go` | you — the go-pg tags are the table schema |
+| `graph/model/user.go` | you — the `bun` tags are the table schema, and the embedded `bun.BaseModel` names the table |
 | `graph/resolver.go` | you — the injection root, plus `newUser`. Never regenerated |
 | `graph/schema.resolvers.go` | **generated shell, hand-written bodies** — five one-liners |
 | `gqlgen.yml`, `main.go` | you, once |

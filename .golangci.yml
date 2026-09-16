@@ -10,9 +10,11 @@ linters:
     - misspell
     - unconvert
     - revive
-    # The linter that catches the errors.As-where-a-type-assertion-was-meant bug. That distinction
-    # is the whole redaction contract in luimaerr.PresentError: errors.As walks the chain, so
-    # matching *gqlerror.Error with it lets any resolver bypass redaction by wrapping one.
+    # Flags every type assertion and every == comparison on an error, so the one place luima wants
+    # an assertion rather than errors.As carries a nolint and has to be argued for in the comment
+    # above it — which is exactly the review this file wants forced. That distinction is one of the
+    # three checks in luimaerr.PresentError's pass-through: errors.As walks the chain, so matching
+    # *gqlerror.Error with it lets any resolver bypass redaction by wrapping one.
     - errorlint
 
   settings:
@@ -28,13 +30,7 @@ linters:
       - comments
       - std-error-handling
     rules:
-      # go-pg reads the tableName field by reflection, so every model has an unexported field
-      # that is never referenced. It is not dead code; it is the table name.
-      - path: (.+)\.go$
-        text: 'tableName'
-        linters: [unused]
-
-      # Examples are documentation. A deliberately-nil *pg.DB and an unchecked Close are what
+      # Examples are documentation. A deliberately-nil *bun.DB and an unchecked Close are what
       # keeps them readable on pkg.go.dev.
       - path: example_test\.go$
         linters: [errcheck, staticcheck]
@@ -45,6 +41,12 @@ formatters:
     - goimports
   settings:
     goimports:
+      # examples/quickstart is deliberately outside all of this. It is a separate module, and both
+      # `make lint` and CI's lint job run golangci-lint at the repo root, which never descends into
+      # it. Pointing a second run at it would fail on graph/schema.resolvers.go: gqlgen owns that
+      # file and writes luima's own imports in the same group as everyone else's, which this
+      # local-prefixes rule rejects — and hand-formatting it is not open either, because the example
+      # job re-runs `go tool gqlgen generate` and fails on any diff.
       local-prefixes:
         - github.com/ulas96/luima
 

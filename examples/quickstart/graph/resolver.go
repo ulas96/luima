@@ -1,7 +1,7 @@
 package graph
 
 import (
-	"github.com/go-pg/pg/v10"
+	"github.com/uptrace/bun"
 
 	"github.com/ulas96/luima/examples/quickstart/graph/model"
 )
@@ -10,7 +10,11 @@ import (
 //
 // @dev Whatever a resolver needs goes here — the pool, and in a real application a logger and
 // your auth context. gqlgen constructs it once and hands it to every resolver.
-type Resolver struct{ DB *pg.DB }
+//
+// *bun.DB rather than bun.IDB: main.go has the concrete handle Connect returns, and a resolver
+// that wants to run inside a transaction passes the bun.Tx db.RunInTx hands it to the crud helpers,
+// which take bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it.
+type Resolver struct{ DB *bun.DB }
 
 // RequestIDKey @notice The context key main.go's HTTPMiddleware writes the request id under.
 //

@@ -7,6 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	// Linked into the test binary only. luimagen itself stays on stdlib plus gqlparser: it writes
+	// bun tags as text and never imports bun. TestCheckTagRejectsTagBreakers is the one place that
+	// has to ask bun what it makes of that text rather than assert it from a doc comment.
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 func TestTableFromFields(t *testing.T) {
@@ -158,20 +164,29 @@ func TestModelSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := string(src)
-	// format.Source column-aligns adjacent struct fields (e.g. "tableName  struct{}" gets an
-	// extra space to line up with the longer "PersonalID string"), so compare against
-	// whitespace-normalized output rather than hardcoding a specific gofmt column width.
+	// format.Source column-aligns adjacent struct fields (e.g. "Name" gets padding to line up with
+	// the longer "PersonalID"), so compare against whitespace-normalized output rather than
+	// hardcoding a specific gofmt column width.
 	norm := strings.Join(strings.Fields(out), " ")
 	for _, want := range []string{
 		"package model",
+		`import "github.com/uptrace/bun"`,
 		"type User struct {",
-		"tableName struct{} `pg:\"app_users\"`",
-		"PersonalID string `pg:\"personal_id,pk\"`",
-		"Projects []string `pg:\"projects,array\"`",
+		"bun.BaseModel `bun:\"table:app_users\"`",
+		"PersonalID string `bun:\"personal_id,pk\"`",
+		"Projects []string `bun:\"projects,array\"`",
 	} {
 		if !strings.Contains(norm, want) {
 			t.Errorf("modelSource() missing %q, got:\n%s", want, out)
 		}
+	}
+	// Naming the table in an unexported field is the one failure mode nothing downstream reports:
+	// bun skips an unexported field that is not embedded without a word, so a generated model
+	// carrying `tableName struct{}` compiles, passes review, and queries the pluralized type name
+	// instead of the table the caller named. Matched as the field declaration, not the bare word —
+	// the doc comment above the struct names tableName on purpose, as the shape not to write.
+	if strings.Contains(norm, "tableName struct{}") {
+		t.Errorf("the generated model still names the table in an unexported field, which bun ignores:\n%s", out)
 	}
 }
 
@@ -223,11 +238,11 @@ func (r *queryResolver) User(ctx context.Context, personalID string) (*model.Use
 	text := string(out)
 	for _, want := range []string{
 		`luima.Get(ctx, r.DB, &model.User{PersonalID: personalID})`,
-		`luima.List[model.User](ctx, r.DB, func(q *orm.Query) *orm.Query {`,
+		`luima.List[model.User](ctx, r.DB, func(q *bun.SelectQuery) *bun.SelectQuery {`,
 		`return luima.Create(ctx, r.DB, &model.User{PersonalID: personalID, Name: input.Name}, "user "+personalID)`,
 		`return luima.Delete(ctx, r.DB, &model.User{PersonalID: personalID})`,
 		`"github.com/ulas96/luima"`,
-		`"github.com/go-pg/pg/v10/orm"`,
+		`"github.com/uptrace/bun"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("patched source missing %q, got:\n%s", want, text)
@@ -246,10 +261,10 @@ func (r *queryResolver) User(ctx context.Context, personalID string) (*model.Use
 	wantImports := `import (
 	"context"
 
-	"github.com/go-pg/pg/v10/orm"
 	"github.com/ulas96/luima"
 	"github.com/ulas96/luima/examples/quickstart/graph/generated"
 	"github.com/ulas96/luima/examples/quickstart/graph/model"
+	"github.com/uptrace/bun"
 )`
 	if !strings.Contains(text, wantImports) {
 		t.Errorf("import block is not sorted and grouped, got:\n%s", text)
@@ -345,8 +360,8 @@ func (r *queryResolver) Counter(ctx context.Context, id int) (*model.Counter, er
 	if strings.Contains(text, `"counter "+id`) {
 		t.Errorf("patched source still concatenates the non-string PK, got:\n%s", text)
 	}
-	// The fixture patches only Create and Get — no List, so no spliced body references orm and
-	// the import must not be added (see TestPatchSourceSkipsOrmWhenListIsHandWritten for the
+	// The fixture patches only Create and Get — no List, so no spliced body references bun and
+	// the import must not be added (see TestPatchSourceSkipsBunWhenListIsHandWritten for the
 	// rule), while fmt survives for the label and luima for every body.
 	wantImports := "import (\n\t\"context\"\n\t\"fmt\"\n\n\t\"github.com/ulas96/luima\"\n)"
 	if !strings.Contains(text, wantImports) {
@@ -354,12 +369,12 @@ func (r *queryResolver) Counter(ctx context.Context, id int) (*model.Counter, er
 	}
 }
 
-// TestPatchSourceSkipsOrmWhenListIsHandWritten pins the import-fix rule for a pre-filled List:
+// TestPatchSourceSkipsBunWhenListIsHandWritten pins the import-fix rule for a pre-filled List:
 // gqlgen preserves a non-stub body on its next generate, so a hand-written Users survives while
-// the other four stubs get spliced. None of the four spliced bodies references orm — only List's
-// q.Order closure does — so the import fixer must not add it, or the consumer's build breaks on
-// an unused import.
-func TestPatchSourceSkipsOrmWhenListIsHandWritten(t *testing.T) {
+// the other four stubs get spliced. None of the four spliced bodies references bun — only List's
+// q.Order closure does, through its *bun.SelectQuery parameter — so the import fixer must not add
+// it, or the consumer's build breaks on an unused import.
+func TestPatchSourceSkipsBunWhenListIsHandWritten(t *testing.T) {
 	tbl := &modelTable{
 		typeName: "User",
 		pk:       column{field: "PersonalID", goType: "string", sql: "personal_id", gql: "String"},
@@ -411,10 +426,12 @@ func (r *queryResolver) User(ctx context.Context, personalID string) (*model.Use
 			t.Errorf("patched source missing %q, got:\n%s", want, text)
 		}
 	}
-	// The hand-written Users body survives untouched and no spliced body mentions orm, so neither
-	// the identifier nor the import may appear anywhere.
-	if strings.Contains(text, "orm") {
-		t.Errorf("patched source references orm although List was left hand-written, got:\n%s", text)
+	// The hand-written Users body survives untouched and no spliced body mentions bun, so neither
+	// the identifier nor the import may appear anywhere. Substring, not a quoted-path check: an
+	// added import and a spliced *bun.SelectQuery are separate ways to break the build, and the
+	// fixture contains no other "bun" for it to trip over.
+	if strings.Contains(text, "bun") {
+		t.Errorf("patched source references bun although List was left hand-written, got:\n%s", text)
 	}
 	// All four remaining fmt.Errorf stubs were spliced and nothing else uses fmt, so the import
 	// must be gone too — same rule as TestPatchSourceFillsAllFiveAndIsIdempotent.
@@ -439,6 +456,10 @@ func TestTableFromFieldsRejectsBadIdentifiers(t *testing.T) {
 		// exits 0 and `go build ./...` then fails in the consumer's module.
 		{"underscored field", "User", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "Owner_Name", Type: "string"}}},
 		{"underscored type", "My_Type", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "Name", Type: "string"}}},
+		// The generated struct embeds bun.BaseModel, so a field of that name is declared twice.
+		// format.Source does not type-check, so the run writes every file and gqlgen then fails.
+		{"field named BaseModel", "User", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "BaseModel", Type: "string"}}},
+		{"PK named BaseModel", "User", []Field{{Name: "BaseModel", Type: "string", PK: true}, {Name: "Name", Type: "string"}}},
 	} {
 		if _, err := tableFromFields(tc.typ, tc.fields); err == nil {
 			t.Errorf("%s: expected an error — an unexported or non-identifier name generates a struct field gqlgen cannot bind and code that does not compile", tc.name)
@@ -1059,20 +1080,81 @@ func TestPlanSDLSeesSiblingSchemaFiles(t *testing.T) {
 	}
 }
 
+// schemaQualified is the model modelSource writes for Options.Table "tenant.users" — the one name
+// TestCheckTagRejectsTagBreakers accepts that is not a plain identifier. A declared type rather
+// than reflect.StructOf: the tags have to be the literal text modelSource emits, and a literal
+// here is what a reader can compare against `bun:%q` by eye. Name is not decoration — an
+// update with nothing but a primary key has an empty SET clause, which bun panics on.
+type schemaQualified struct {
+	bun.BaseModel `bun:"table:tenant.users"`
+
+	ID   string `bun:"id,pk"`
+	Name string `bun:"name"`
+}
+
+// tagSeparated is what modelSource would emit for a table and a column carrying bun's own tag
+// separators, if checkTag let them through. It exists to measure the damage the rejection prevents,
+// which is the half a rejection test cannot state on its own — nothing about `checkTag` returning
+// an error proves the input was worth refusing.
+type tagSeparated struct {
+	bun.BaseModel `bun:"table:ten,ant"`
+
+	ID       string   `bun:"id,pk"`
+	Projects []string `bun:"pro:jects,array"`
+}
+
 // TestCheckTagRejectsTagBreakers pins the two inputs that are not checked Go identifiers.
-// Options.Table and Field.Column go verbatim into a backtick-delimited `pg:"…"` tag, so a backtick
+// Options.Table and Field.Column go verbatim into a backtick-delimited `bun:"…"` tag, so a backtick
 // ends the tag literal early and everything %q escapes — a double quote, a backslash, a tab —
-// becomes a literal backslash sequence inside the raw string that go-pg reads as part of the name.
+// becomes a literal backslash sequence inside the raw string that bun reads as part of the name.
 // The backslash and tab cases are why the check is strconv.Quote and not two ContainsAny bytes.
+//
+// ',' and ':' are the other half, and the one strconv.Quote cannot see: both are legal in a Go
+// struct tag and both are separators in bun's own tag grammar, so they do not break the tag, they
+// change the name bun binds. The damage is measured below rather than asserted, because it is the
+// reason to reject rather than to document.
+//
+// Accepting "tenant.users" is only half a claim, so the second half is measured rather than
+// asserted from the doc comment: bun has to turn that tag into a usable table name. It does —
+// schemaFromTagName splits on the dot and quoteIdent quotes each half, giving "tenant"."users" in
+// the select, insert, update and delete alike. Worth pinning because the table name rides the
+// tag's *value*, where internal/tagparser's parseValue treats a different set of bytes as special
+// than the name position checkTag's rejection set was first written for.
 func TestCheckTagRejectsTagBreakers(t *testing.T) {
-	for _, bad := range []string{"my`table", `my"table`, `ten\ant.users`, "ten\tant"} {
+	for _, bad := range []string{"my`table", `my"table`, `ten\ant.users`, "ten\tant", "ten,ant", "pro:jects"} {
 		if err := checkTag("table name", bad); err == nil {
 			t.Errorf("checkTag(%q) = nil, want an error before anything is written", bad)
 		}
 	}
+	// Why those last two are worth an error rather than a note in the doc comment. A ',' ends the
+	// value, so the table is "ten" and the rest becomes an unknown option; a ':' in the *name* half
+	// opens an option instead of naming the column, so Tag.Name is empty and (*Table).newField falls
+	// back to Underscore("Projects") — a caller's explicit Field.Column replaced by the default it
+	// was written to override, with bun's one WARN naming the leftover option and nothing at all
+	// about the substitution. Both bind against a name nobody wrote, and both compile.
+	sep := bun.NewDB(nil, pgdialect.New()).NewSelect().Model((*tagSeparated)(nil)).String()
+	if !strings.Contains(sep, `FROM "ten"`) || !strings.Contains(sep, `"projects"`) {
+		t.Errorf("bun's tag separators no longer silently rewrite a name — recheck checkTag's rejection set against internal/tagparser, got: %s", sep)
+	}
 	// A schema-qualified name is not an identifier and must still pass — this is not an ident check.
 	if err := checkTag("table name", "tenant.users"); err != nil {
 		t.Errorf("checkTag(\"tenant.users\") = %v, want nil", err)
+	}
+	// bun.NewDB(nil, …) never dials: pgdialect's Init ignores the *sql.DB, and String() formats
+	// each statement offline — so this reads bun's real naming path with no database in sight.
+	// All four, because all four are what luimagen generates a resolver for: Get and List select,
+	// Create inserts, Update updates, Delete deletes.
+	db := bun.NewDB(nil, pgdialect.New())
+	m := &schemaQualified{ID: "x"}
+	for _, sql := range []string{
+		db.NewSelect().Model((*schemaQualified)(nil)).String(),
+		db.NewInsert().Model(m).String(),
+		db.NewUpdate().Model(m).WherePK().String(),
+		db.NewDelete().Model(m).WherePK().String(),
+	} {
+		if !strings.Contains(sql, `"tenant"."users"`) {
+			t.Errorf("bun must read `bun:\"table:tenant.users\"` as the schema-qualified table, got: %s", sql)
+		}
 	}
 }
 
@@ -1129,8 +1211,8 @@ func (r *queryResolver) User(ctx context.Context, personalID string) (*model.Use
 	}
 }
 
-// TestPlanSDLIgnoresBlockDescriptions pins the second SDL comment form. `#` is handled by the line
-// anchor; a """ block is not — its prose lines start at column zero like any declaration, so
+// TestPlanSDLIgnoresBlockDescriptions pins the second way SDL carries prose. `#` is handled by the
+// line anchor; a """ block is not — its prose lines start at column zero like any declaration, so
 // "type Query is the root of every read path" inside one used to read as a Query declaration and
 // emit `extend type Query` with no base type for gqlparser to reject at stage 3.
 func TestPlanSDLIgnoresBlockDescriptions(t *testing.T) {
@@ -1191,8 +1273,8 @@ func present(err error) error { return l.PresentError(nil, err) }
 	if !strings.Contains(string(out), "\n\t\"github.com/ulas96/luima\"") {
 		t.Errorf("no unaliased luima import was added, so the spliced luima.Get does not compile:\n%s", out)
 	}
-	if !strings.Contains(string(out), "\n\t\"github.com/go-pg/pg/v10/orm\"") {
-		t.Errorf("no unaliased orm import was added, so the spliced List closure does not compile:\n%s", out)
+	if !strings.Contains(string(out), "\n\t\"github.com/uptrace/bun\"") {
+		t.Errorf("no unaliased bun import was added, so the spliced List closure does not compile:\n%s", out)
 	}
 }
 
@@ -1387,7 +1469,7 @@ func TestCheckIdentRejectsNonASCII(t *testing.T) {
 	}
 }
 
-// TestFieldColumnOverridesTheDerivedName pins the escape hatch snakeCase needs. go-pg's rule
+// TestFieldColumnOverridesTheDerivedName pins the escape hatch snakeCase needs. bun's rule
 // inserts no separator inside a run of capitals, so URLID becomes urlid while the DBA's column is
 // almost certainly url_id — and luimagen does not create the table, so the mismatch compiles and
 // fails on the first query.

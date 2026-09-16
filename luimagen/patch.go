@@ -84,7 +84,7 @@ func targets(t *modelTable, modelPkg string, inputFields map[string]string) []ta
 			// pagination (CLAUDE.md, "out of scope, deliberately"), so an uncapped list is a
 			// footgun on a growing table — and a silent cap is indistinguishable from a table
 			// that really holds 100 rows.
-			return fmt.Sprintf("// Capped at 100 rows: luima ships no pagination, so this bounds an\n\t// otherwise unbounded query. Raise or drop the Limit to suit the table.\n\treturn luima.List[%s.%s](ctx, r.DB, func(q *orm.Query) *orm.Query {\n\t\treturn q.Order(%q).Limit(100)\n\t})", modelPkg, typeName, t.pk.sql)
+			return fmt.Sprintf("// Capped at 100 rows: luima ships no pagination, so this bounds an\n\t// otherwise unbounded query. Raise or drop the Limit to suit the table.\n\treturn luima.List[%s.%s](ctx, r.DB, func(q *bun.SelectQuery) *bun.SelectQuery {\n\t\treturn q.Order(%q).Limit(100)\n\t})", modelPkg, typeName, t.pk.sql)
 		}},
 		{"mutationResolver", "Create" + typeName, 2, func(p []string) string {
 			return fmt.Sprintf("return luima.Create(ctx, r.DB, &%s.%s{%s: %s, %s}, %s)",
@@ -136,7 +136,7 @@ func inputFieldNames(modelDir, structName string) (map[string]string, error) {
 // findStruct finds the struct type named name. Case-insensitive for the same reason findFunc is,
 // and it is the same rule applied to the other half of the seam: Generate asks for
 // Options.Type+"Input", but gqlgen names the generated struct templates.ToGoModelName(name)
-// (plugin/modelgen/models.go), which re-capitalizes the 24 common initialisms — so SDL
+// (plugin/modelgen/models.go), which re-capitalizes the common initialisms — so SDL
 // `input ApiKeyInput` comes back as `type APIKeyInput struct`. An exact match misses it, and the
 // miss lands at stage 4, after the model file and the SDL fragment are already on disk.
 func findStruct(file *ast.File, name string) *ast.StructType {
@@ -510,19 +510,21 @@ func importEdits(src []byte, fset *token.FileSet, file *ast.File) ([]edit, error
 		}
 	}
 	// Each import is added only when a surviving identifier names its package: every body
-	// references luima, but only List's q.Order closure references orm — so a hand-written List
-	// left alone (a body gqlgen preserved) must not drag in an orm import nothing uses, or the
+	// references luima, but only List's q.Order closure references bun — so a hand-written List
+	// left alone (a body gqlgen preserved) must not drag in a bun import nothing uses, or the
 	// consumer's build breaks on an unused import. fmt rides the same loop, after the drop above.
 	//
 	// The add is keyed on the *name* being free, not only on the path being absent. A resolver file
-	// that already binds luima (or orm, or fmt) to some other path — an alias a hand-written body
+	// that already binds luima (or bun, or fmt) to some other path — an alias a hand-written body
 	// uses — would otherwise get a second, unaliased import of that name spliced in beside it, and
 	// "luima redeclared in this block" is a build failure in the consumer's module that nothing
 	// here would catch: format.Source does not typecheck.
 	for _, need := range []struct{ path, ident string }{
 		{"fmt", "fmt"},
 		{"github.com/ulas96/luima", "luima"},
-		{"github.com/go-pg/pg/v10/orm", "orm"},
+		// bun, not a luima re-export: the spliced List closure names *bun.SelectQuery, which is
+		// bun's own type and has no alias under github.com/ulas96/luima.
+		{"github.com/uptrace/bun", "bun"},
 	} {
 		if hasUnaliasedImport(imports, need.path) || !usesIdent(file, need.ident) {
 			continue

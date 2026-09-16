@@ -9,8 +9,13 @@ r.All(endpoint, adaptor.HTTPHandlerWithContext(withFiberContext(srv)))
 ```
 
 `adaptor.HTTPHandlerWithContext` wraps `fasthttpadaptor`, converting fasthttp's `RequestCtx` into
-an `*http.Request` **per request**. Never plain `HTTPHandler` on this route: that variant hands the
-resolver the raw `*fasthttp.RequestCtx`, which reports no deadline and never cancels.
+an `*http.Request` **per request**, and stashes Fiber's own request context where `withFiberContext`
+can unwrap it onto that request. Never plain `HTTPHandler` on this route: it stashes nothing, so the
+resolver is left with the raw `*fasthttp.RequestCtx`, which satisfies `context.Context` only
+nominally — `Deadline` reports none, and `Done` closes on server shutdown rather than when the
+client hangs up. Nothing luima sets could impose a deadline on it — `RequestTimeout` works through
+Fiber's `c.SetContext`, and `HTTPHandlerWithContext` is the only side that carries that across — and
+resolver code that respects cancellation would be dead code that reads as correct.
 
 > **Be clear about what that buys.** Fiber here provides routing, middleware and its ecosystem —
 > **not** speed. gqlgen does exactly the work it always did, plus a conversion. Anyone telling you
@@ -48,9 +53,11 @@ offer a second one through `Config.Fiber.ErrorHandler` and does not document one
 sets it and assumes their resolver errors flow through it has built a redaction layer that never
 runs.
 
-**It is not the only path to the wire, and that distinction matters.** Transport-level failures are
-written by gqlgen's transport *before* an executor exists, so they never reach the presenter and
-are not redacted. POST a malformed JSON body and the response is HTTP 400 with your own bytes
+**It is not the only path to the wire, and that distinction matters.** A request no transport
+accepts is answered `"transport not supported"` by gqlgen's handler before any transport runs, so it
+never reaches the presenter. A malformed JSON body does reach it — `transport.POST` reports it
+through `Executor.DispatchError` — but as a `*gqlerror.Error` with no cause, reported outside field
+resolution, so it passes through unredacted and the response is HTTP 400 with your own bytes
 reflected back:
 
 ```
@@ -58,14 +65,15 @@ reflected back:
  beginning of value body:{\"query\": SECRET-CANARY-abc"}],"data":null}
 ```
 
-Same for `"transport not supported"`. Nothing of the *server's* is in that path — it is the
-caller's own body coming back to the caller — but do not decide you need not sanitize something on
-the strength of "everything goes through `PresentError`".
+Nothing of the *server's* is in either path — it is the caller's own body coming back to the
+caller — but do not decide you need not sanitize something on the strength of "everything goes
+through `PresentError`".
 
 The good news, measured alongside: errors gqlgen *does* hand to the presenter keep their codes.
 Parse (`GRAPHQL_PARSE_FAILED`), validation (`GRAPHQL_VALIDATION_FAILED`) and complexity
 (`COMPLEXITY_LIMIT_EXCEEDED`) rejections come out byte-identical to gqlgen's own
-`DefaultErrorPresenter` — the `*gqlerror.Error` pass-through branch carries them for free.
+`DefaultErrorPresenter` — the pass-through for a `*gqlerror.Error` that wraps nothing and was
+reported outside field resolution carries them for free.
 
 ---
 
@@ -108,10 +116,14 @@ Two things did block them:
   after `Configure`.
 - **fasthttp does not cancel the request context when the client hangs up.** Measured: the client
   closed the connection after three frames and the resolver was still producing twenty frames later,
-  with `ctx.Err() == nil`. For a query that is survivable, because `RequestTimeout` bounds it at
-  15s. For a subscription it is not — a subscription has to disable `RequestTimeout` to live longer
-  than 15s, and disabling it removes the only bound there is, so an abandoned subscription holds a
-  goroutine and its database work forever. **This one is upstream**, and it is the real blocker.
+  with `ctx.Err() == nil`. For a query that is survivable, because `RequestTimeout` deadlines the
+  resolver context at 15s and the abandoned goroutine unwinds when it expires — *the goroutine*, and
+  that is the whole of it. pgdriver never sends a CancelRequest, so a statement whose client stopped
+  waiting keeps running on Postgres, and only `statement_timeout` (`luima.StatementTimeout`, or
+  `?statement_timeout=` in the DSN) stops it; pair the two rather than assume one implies the other.
+  For a subscription even the goroutine is unbounded — a subscription has to disable
+  `RequestTimeout` to live longer than 15s, and disabling it removes the only bound there is.
+  **This one is upstream**, and it is the real blocker.
 
 `transport.Websocket` was not measured. The adaptor implements `http.Hijacker` as of fasthttp v1.72
 (`fasthttpadaptor/adaptor.go`), which is the interface gorilla's `Upgrader.Upgrade` type-asserts, so
@@ -125,8 +137,9 @@ it is no longer structurally blocked — but this document does not claim it wor
 srv := handler.New(cfg.Schema)
 ```
 
-Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it gives no way to set an error
-presenter, which makes the [error contract](../README.md#error-handling) impossible.
+Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it registers a transport and extension
+set luima has to choose for itself: `transport.MultipartForm` (gotcha #37's CSRF hole),
+`transport.Websocket` and APQ, with every transport registered before any `Configure` could run.
 
 ```go
 srv.AddTransport(transport.Options{})  // answers the OPTIONS preflight

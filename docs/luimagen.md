@@ -36,7 +36,7 @@ builds a table's CRUD layer", and it relocates (rather than removes) the review 
 `Field{Name, Type, PK}` call site plus the generated model file are both visible in the diff. A
 `Field.Type` outside the mapped set is rejected loudly before anything is written; a
 mapped-but-wrong type (a column that should be `text` declared as `int`) is caught by nothing
-here, exactly as a hand-typed go-pg tag never was — luimagen closes no correctness gap, it only
+here, exactly as a hand-typed `bun:"…"` tag never was — luimagen closes no correctness gap, it only
 moves where a mistake is visible.
 
 ## 2 · The mechanism
@@ -72,23 +72,46 @@ GraphQL scalar:
   injected `@goModel`/`@goField`. It is also what lets `snakeCase` and `lowerFirst` treat their
   rune handling as belt-and-braces rather than as the thing keeping the SDL valid.
 - `Options.Table` and `Field.Column` are the inputs that are not checked identifiers — they are SQL
-  names, and `tenant.users` is valid — so they are checked only against the raw-string `pg:"…"` tag
-  they are written into verbatim: a backtick ends the literal early, and **anything `%q` escapes**
-  — a double quote, a backslash, a tab, a control character — becomes a literal backslash sequence
-  inside the raw string that go-pg reads as part of the name. The test is `strconv.Quote(v) ==
-  "\""+v+"\""`, not two hand-picked characters, because the backslash case is the one that looks
-  fine in the flag and mangles silently.
+  names, and `tenant.users` is valid, since bun splits it on the dot and quotes each half into
+  `"tenant"."users"` — so they are checked instead against the raw-string `bun:"…"` tag they are
+  written into verbatim. **Go's grammar first:** a backtick ends the literal early, and **anything
+  `%q` escapes** — a double quote, a backslash, a tab, a control character — becomes a literal
+  backslash sequence inside the raw string that bun then reads as part of the name. The test is
+  `strconv.Quote(v) == "\""+v+"\""`, not two hand-picked characters, because the backslash case is
+  the one that looks fine in the flag and mangles silently.
+- **Then bun's own tag grammar**, which rejects `,` and `:` in both values. One function checks
+  both, and the rule it applies is the union of what each half of a tag makes special, because the
+  two names land in different halves: a column name is the tag's *name* (`bun:"projects,array"`)
+  while the table name is an option *value* (`bun:"table:tenant.users"`). `,` separates in both —
+  `internal/tagparser`'s `parseKeyValue` ends the name there and `parseValue` ends the value there —
+  so, measured on v1.2.18, `bun:"pro,jects,array"` binds the column `pro` and `bun:"table:ten,ant"`
+  selects `FROM "ten"`, each with nothing louder than a WARN about the leftover option. `:` is
+  special in the name half only, where it opens an option: `bun:"pro:jects,array"` leaves `Tag.Name`
+  empty, so `(*Table).newField` falls back to its own `Underscore(sf.Name)` and binds that instead —
+  the same one WARN, `has unknown tag option: "pro"`, and nothing at all about the name substituted
+  for the one you wrote. Rejecting `:` in a table name too is the
+  over-strict half of that shared rule and costs nothing — nobody names a table with a colon, while
+  a column named with one is the silent case the check exists for. Neither byte can be escaped past
+  the parser, either: quoting is its own escape, and the `%q` rule above already rejects the double
+  quote that would open one. `(` is the byte with special meaning that is deliberately let
+  *through* — `parseValue` hands it to `skipPairs`, which scans to the matching `)` and returns the
+  value whole, and `parseKeyValue` gives it no meaning at all, so `ten(ant` survives in either
+  position.
 - Every `Field.Type` must be `string`, `int`, `float64`, `bool`, or a slice of one of
   those — exactly the Go types that round-trip through gqlgen's default bindings (GraphQL `Int`
   becomes Go `int`, `Float` becomes `float64`). Other widths (`int64`, `uint*`,
   `float32`) would generate resolver code that does not compile, so they are errors, not guesses.
-- The SQL column name is `snakeCase(Field.Name)` — byte-for-byte go-pg's own `Underscore`
-  convention (`PersonalID` → `personal_id`, `URLValue` → `url_value`). **`Field.Column` overrides
-  it**, and the case that needs it is the one go-pg's rule cannot derive: an underscore goes in only
-  when a neighbouring rune is lower-case, so a run of capitals gets none at all — `URLID` becomes
-  `urlid` where the column is almost certainly `url_id`. luimagen does not create the table, so a
-  derived name that disagrees with it compiles, vets and lints clean, and fails on the first query
-  with `column "urlid" does not exist`. `Options.Table` is the same escape hatch one level up.
+- The SQL column name is `snakeCase(Field.Name)` — byte-for-byte bun's own `Underscore` convention
+  (`PersonalID` → `personal_id`, `URLValue` → `url_value`). This is the one function the bun port
+  did not have to re-derive: bun's `Underscore` is byte-identical to the go-pg function it was
+  written against — both in `internal/underscore.go`, agreeing line for line through the function
+  itself — so every column name luimagen has ever derived still lands on the same
+  column. **`Field.Column` overrides it**, and the case that needs it is the one bun's rule cannot
+  derive: an underscore goes in only when a neighbouring rune is lower-case, so a run of capitals
+  gets none at all — `URLID` becomes `urlid` where the column is almost certainly `url_id`. luimagen
+  does not create the table, so a derived name that disagrees with it compiles, vets and lints
+  clean, and fails on the first query with `column "urlid" does not exist`. `Options.Table` is the
+  same escape hatch one level up.
 - **No two fields may collide on either derived name.** The exact-duplicate case is the likeliest
   CLI typo — a repeated `-field` flag — and would emit the struct field twice, failing at gqlgen
   with both files already written. The other two are silent: `URLValue` and `UrlValue` are distinct
@@ -97,10 +120,14 @@ GraphQL scalar:
   here, where nothing has been written yet.
 
 `writeModel` then writes `<ModelDir>/<type>.go` with the same shape as the quickstart's
-hand-written model — a NatSpec doc comment explaining the three load-bearing details, `tableName
-struct{}` carrying the table name, the PK tagged `,pk`, array columns tagged `,array` — and refuses
-to overwrite an existing file, so a second run fails loud instead of clobbering a file that may
-since have been hand-edited. The doc comment is not decoration: this file lands in the *consumer's*
+hand-written model — an `import "github.com/uptrace/bun"`, a NatSpec doc comment explaining the
+three load-bearing details, an embedded `bun.BaseModel` tagged `bun:"table:…"`, the PK tagged `,pk`,
+array columns tagged `,array` — and refuses to overwrite an existing file, so a second run fails
+loud instead of clobbering a file that may since have been hand-edited. The import is unconditional
+because the embedded `BaseModel` is always there, and that embedded field is the only thing naming
+the table: an unexported `tableName struct{}` — the spelling a reader porting a model by hand
+reaches for — is dropped by bun without a word, pointing every query at the underscored, pluralized
+type name instead. The doc comment is not decoration either: this file lands in the *consumer's*
 module, and `revive`'s `exported` rule — which `.golangci.yml` enables here, and which a consumer
 who copied this config inherits — flags a bare `type User struct` as an error on code they did not
 write.
@@ -260,12 +287,14 @@ The patch is safe to run more than once, and the failure mode is deliberate:
   the second still declares it, which is a redeclare and a build failure. `fmt` is dropped once no
   surviving code uses it — keyed on the *binding* name, so an aliased `f "fmt"` whose `f` is now
   dead goes too, which is what stops it surviving unused beside a freshly added `"fmt"` — and added
-  back when a non-string PK label needs it. `luima` and `orm` are added only when a surviving
-  identifier references them: a hand-written `List` left alone must not drag in an `orm` import
-  nothing uses, which would break the build. Every add is keyed on the *name* being free, not only
-  on the path being absent — a file that already binds `luima` to a fork gets a clear error naming
-  the conflict, rather than a second unaliased import and `luima redeclared in this block`, which
-  `format.Source` cannot catch because it does not typecheck.
+  back when a non-string PK label needs it. `luima` and `bun` are added only when a surviving
+  identifier references them: every generated body names `luima`, but only `List`'s closure names
+  `*bun.SelectQuery`, so a hand-written `List` left alone must not drag in a `bun` import nothing
+  uses, which would break the build. It is bun's own import and not a luima re-export, because
+  `*bun.SelectQuery` has no alias under `github.com/ulas96/luima`. Every add is keyed on the *name*
+  being free, not only on the path being absent — a file that already binds `luima` to a fork gets a
+  clear error naming the conflict, rather than a second unaliased import and `luima redeclared in
+  this block`, which `format.Source` cannot catch because it does not typecheck.
 - **A failed mid-run call is recovered manually, on purpose.** Every read-only check runs first, so
   a bad `Field`, a duplicate type, or a missing schema file fails with nothing written. Past that
   point `writeModel` and `appendSDL` run before gqlgen and the patch, so if either later stage
@@ -306,7 +335,7 @@ model generation *is* in scope — and its cost is the trade-off stated in §1.
 | Composite / array primary keys | **no.** Exactly one scalar `PK: true` is the whole scope; anything else errors |
 | Auth predicates in the generated `opts` | **no.** luima ships no auth; a guessed ownership predicate would be worse than the hand-written escape hatch the library provides |
 | Scalar types beyond `string`/`int`/`float64`/`bool` (+ slices) | **no.** Error clearly, naming the gqlgen binding mismatch |
-| SQL column name override | **done.** `Field.Column` (`-field Name:Type:column=<sql name>`). go-pg's rule inserts no separator inside a run of capitals, so `URLID` derives `urlid` where the column is `url_id` — and since luimagen does not create the table, the mismatch only surfaces as a query-time `column does not exist`. `Options.Table` is the same hatch one level up |
+| SQL column name override | **done.** `Field.Column` (`-field Name:Type:column=<sql name>`). bun's rule inserts no separator inside a run of capitals, so `URLID` derives `urlid` where the column is `url_id` — and since luimagen does not create the table, the mismatch only surfaces as a query-time `column does not exist`. `Options.Table` is the same hatch one level up. Both values are also rejected for a `,` or a `:`, which bun's tag grammar would read as a separator (§2.1) |
 | GraphQL field name override | **no, not yet.** The field name derives from `Field.Name` through `lowerFirst`; unlike a column name it has no external table to disagree with, so the override stays deferred for names no convention derives (reserved words) |
 | `Options.ResolverFile` independent of `SchemaFile` | **done.** It defaults to `SchemaFile` with `.resolvers.go` for its extension, which is where `resolver.layout: follow-schema` puts the stubs. Still overridable for a layout that puts them elsewhere |
 | Re-running `Generate` for a type whose model file exists | **no.** `writeModel` refuses to overwrite, like `appendSDL`'s duplicate guard |

@@ -16,18 +16,24 @@ make luimagen-roundtrip  # scaffold a type into a scratch copy of the example �
 
 Single test: `go test -v -count=1 -run TestCRUD ./tests/` (with `DATABASE_URL` set for that one).
 
-**A green `go test ./...` proves less than it looks.** `TestCRUD` is the only test that touches a
-real driver, and it `t.Skip`s without `DATABASE_URL` — a skip still reports `ok`. Confirm
-`--- PASS: TestCRUD`, not `--- SKIP`. CI pins this with a `postgres:16` service container and greps
-the `-v` output. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL`
-(copy `.env.example` → `.env`, unquoted) is the whole setup.
+**A green `go test ./...` proves less than it looks.** Four tests `t.Skip` without `DATABASE_URL`,
+and a skip still reports `ok`: `TestCRUD`, `TestStatementTimeout`,
+`TestStatementTimeoutNegativeDisables` and `TestConnectPoolBound`. They are the only ones that reach
+a server, which is where a `SET` that never arrives, a bound Postgres does not enforce and a pool
+left at `database/sql`'s sizing all look exactly like the working thing. Confirm
+`--- PASS: TestCRUD`, not `--- SKIP`. CI runs all four against a `postgres:16` service container
+and greps the `-v` output for each one's `^--- PASS: <name> (` — anchored, because
+`TestStatementTimeoutConnParams` needs no database and a prefix match lets it stand in for a skipped
+`TestStatementTimeout`. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL` (copy
+`.env.example` → `.env`, unquoted) is the whole setup.
 
 ## Architecture
 
-luima is the boilerplate between gqlgen and Fiber v3, over go-pg. It **cannot** replace gqlgen
-codegen — `generated.NewExecutableSchema` is a symbol only the consumer's own `go tool gqlgen
-generate` produces. Consumers still own `gqlgen.yml`, `schema.graphqls`, `graph/resolver.go`.
-`docs/gqlgen-contract.md` is that contract; `docs/gotchas.md` is the failure catalogue.
+luima is the boilerplate between gqlgen and Fiber v3, over bun with `pgdialect` and `pgdriver`. It
+**cannot** replace gqlgen codegen — `generated.NewExecutableSchema` is a symbol only the consumer's
+own `go tool gqlgen generate` produces. Consumers still own `gqlgen.yml`, `schema.graphqls`,
+`graph/resolver.go`. `docs/gqlgen-contract.md` is that contract; `docs/gotchas.md` is the failure
+catalogue.
 
 | package | what belongs there |
 |---|---|
@@ -55,17 +61,29 @@ directory), but they still compile and their `Output` blocks still run.
 `luimagen/internal_test.go` is the one exception, and `package luimagen`. The rule buys a
 consumer's-eye view of an API, and `Generate` has almost none — one call that shells out to gqlgen
 and rewrites files. Everything worth pinning is in the unexported steps between: `snakeCase`'s
-go-pg boundary, `lowerFirst`, the declare-vs-extend probe, `patchSource`'s splice and its import
-fix. `tests/luimagen_test.go` still covers the exported surface from outside. `docs/luimagen.md` §5.
+column boundary (bun's `Underscore` is byte-identical to the go-pg one it was written against —
+both `internal/underscore.go`, agreeing line for line through the function — so no derived column
+name moved in the port), `checkTag`'s two rejections, `lowerFirst`, the declare-vs-extend probe,
+`patchSource`'s splice and its import fix. `tests/luimagen_test.go` still covers the exported
+surface from outside. `docs/luimagen.md` §5.
 
 ### The two load-bearing invariants
 
 1. **Error redaction is the design.** `luimaerr.PresentError` passes through `*CustomError` (the
-   resolver declared it safe) and `*gqlerror.Error` (gqlgen's own text about the client's query —
-   drop that branch and every schema typo reads as "internal server error"); everything else is
-   logged server-side and redacted. luima ships no auth, so this is the only thing between a caller
-   and your constraint and column names. This is *why* `crud/` exists — the helpers do the
-   classification so a resolver can't forget it.
+   resolver declared it safe) and a `*gqlerror.Error` that wraps nothing and was reported outside
+   field resolution (gqlgen's own text about the client's query — drop that branch and every
+   schema typo reads as "internal server error"); everything else is logged server-side and
+   redacted. luima ships no auth, so this is the only thing between a caller and your constraint
+   and column names. This is *why* `crud/` exists — the helpers do the classification so a
+   resolver can't forget it.
+
+   The type is not the check. gqlgen hands a resolver's plain error to the presenter already
+   wrapped in a `*gqlerror.Error` whose message is `err.Error()`, so matching on the type alone
+   sends driver text to the client — which every release through 0.5.0 did. `Unwrap() == nil`
+   rejects that wrapper, and `graphql.GetFieldContext(ctx) == nil` rejects a cause-less one a
+   resolver returns without having written it, such as a list decoded from an upstream GraphQL
+   response. `TestPresentErrorOverHTTP` pins both over HTTP, because a test that calls
+   `PresentError` directly only sees a wrapper it built itself.
 
 2. **`server.Mount` registers `r.All(endpoint, ...)`, never `r.Post`.** gqlgen's transports dispatch
    on method themselves, so GET, POST and the OPTIONS preflight must all reach the handler.
@@ -117,8 +135,8 @@ question to answer first is which `Config` field or free function is missing.
   and `luimagen/patch.go` are exempt — they are one internal pipeline, and their reasoning is
   carried as prose here and in `docs/luimagen.md` §2 rather than split across thirty tag blocks.
   `luimagen/luimagen.go` and `cmd/luimagen/main.go` are not exempt: they are the exported surface.
-- Comments explain what breaks if the line is removed (`All` not `Post`, the two absence signals in
-  `Update`, `RETURNING *`). If code moves, the comment moves with it.
+- Comments explain what breaks if the line is removed (`All` not `Post`, `Exec` not `Scan` in
+  `Create` and `Update`, `RETURNING *`). If code moves, the comment moves with it.
 - A behaviour change needs a test that fails without it; new public API needs a godoc example in
   `tests/`; update `CHANGELOG.md` under `## [Unreleased]`.
 

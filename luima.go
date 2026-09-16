@@ -3,7 +3,7 @@
 //
 // @dev It is two things: a runtime — Config to a *fiber.App with the gqlgen handler mounted
 // correctly, a Postgres pool, and an error presenter that does not leak your schema — and
-// resolver-body helpers, generic CRUD over go-pg that gets the error classification right.
+// resolver-body helpers, generic CRUD over bun that gets the error classification right.
 //
 // It is not, and cannot be, a replacement for gqlgen codegen. gqlgen generates code into your
 // module: generated.NewExecutableSchema is a symbol only your own `go tool gqlgen generate` run
@@ -48,9 +48,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-pg/pg/v10"
-	"github.com/go-pg/pg/v10/orm"
 	"github.com/gofiber/fiber/v3"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
 	"github.com/ulas96/luima/crud"
@@ -112,34 +112,36 @@ func RateLimit(n int, per time.Duration, key func(*http.Request) string) func(ht
 
 // Connect @notice Opens the pool the resolvers query through and proves it works.
 //
-// @param url     a postgres:// or postgresql:// connection string
-// @return *pg.DB a live pool, already proven with a round trip. See [db.Connect].
-// @return error  a parse failure, or the ping failure with the pool already closed
-func Connect(url string) (*pg.DB, error) { return luimadb.Connect(url) }
+// @param url      a postgres:// or postgresql:// connection string
+// @return *bun.DB the bun handle over a live pool, already proven with a round trip. See
+// [db.Connect].
+// @return error   a parse failure, or the ping failure with the pool already closed
+func Connect(url string) (*bun.DB, error) { return luimadb.Connect(url) }
 
-// ConnectWith @notice Connect, plus the pg.Options tuning a DSN cannot express.
+// ConnectWith @notice Connect, plus the pgdriver.Config tuning that has to be code.
 //
-// @param url     a postgres:// or postgresql:// connection string
-// @param tune    called with the parsed options; nil is exactly Connect
-// @return *pg.DB a live pool, already proven with a round trip. See [db.ConnectWith].
-// @return error  a parse failure, or the ping failure with the pool already closed
-func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error) {
+// @param url      a postgres:// or postgresql:// connection string
+// @param tune     called with the parsed config; nil is exactly Connect
+// @return *bun.DB the bun handle over a live pool, already proven with a round trip. See
+// [db.ConnectWith].
+// @return error   a parse failure, or the ping failure with the pool already closed
+func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 	return luimadb.ConnectWith(url, tune)
 }
 
 // StatementTimeout @notice A tune func for ConnectWith that bounds every query server-side.
 //
 // @param d the bound; Postgres cancels a statement that exceeds it. Zero or negative disables it.
-// @return func(*pg.Options) a tune func for ConnectWith. See [db.StatementTimeout].
-func StatementTimeout(d time.Duration) func(*pg.Options) { return luimadb.StatementTimeout(d) }
+// @return func(*pgdriver.Config) a tune func for ConnectWith. See [db.StatementTimeout].
+func StatementTimeout(d time.Duration) func(*pgdriver.Config) { return luimadb.StatementTimeout(d) }
 
 // PresentError @notice The error contract, and Config.ErrorPresenter's default.
 //
 // @dev A function rather than a var: a package-level var would let any consumer reassign the
 // error contract for every other consumer in the binary.
 //
-// @param ctx  the resolver context, read only for the GraphQL field path
-// @param err  the error a resolver returned
+// @param ctx  the request context, read for the field context and the path
+// @param err  the error gqlgen reports; a resolver's arrives already wrapped
 // @return *gqlerror.Error the message the client receives. See [luimaerr.PresentError].
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	return luimaerr.PresentError(ctx, err)
@@ -160,64 +162,64 @@ func SQLState(err error) string { return luimaerr.SQLState(err) }
 // Get @notice Selects one row by primary key; a missing row is (nil, nil).
 //
 // @param ctx   the resolver context
-// @param d     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
+// @param d     bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it
 // @param key   a model with only its primary key populated
 // @param opts  query modifiers applied left to right, after WherePK
 // @return *T   the stored row, or nil when no row matched. See [crud.Get].
-// @return error any driver error other than pg.ErrNoRows
-func Get[T any](ctx context.Context, d orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+// @return error any driver error other than sql.ErrNoRows
+func Get[T any](ctx context.Context, d bun.IDB, key *T, opts ...func(*bun.SelectQuery) *bun.SelectQuery) (*T, error) {
 	return crud.Get[T](ctx, d, key, opts...)
 }
 
 // List @notice Selects rows, applying each opt to the query in order.
 //
 // @param ctx   the resolver context
-// @param d     orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
+// @param d     bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it
 // @param opts  query modifiers applied left to right; none means "select every row"
 // @return []*T the rows, never nil. See [crud.List].
 // @return error any driver error
-func List[T any](ctx context.Context, d orm.DB, opts ...func(*orm.Query) *orm.Query) ([]*T, error) {
+func List[T any](ctx context.Context, d bun.IDB, opts ...func(*bun.SelectQuery) *bun.SelectQuery) ([]*T, error) {
 	return crud.List[T](ctx, d, opts...)
 }
 
 // Create @notice Inserts m and returns the stored row, classifying 23505 as a conflict.
 //
 // @param ctx    the resolver context
-// @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
+// @param d      bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it
 // @param m      the model to insert
 // @param label  names the thing in the conflict message
-// @param opts   query modifiers, e.g. q.OnConflict("DO NOTHING")
+// @param opts   query modifiers, e.g. q.On("CONFLICT DO NOTHING")
 // @return *T    the stored row with RETURNING * applied, or nil if the insert was suppressed.
 // See [crud.Create].
 // @return error a *CustomError on 23505, nil on a suppressed insert, the bare driver error
 // otherwise
-func Create[T any](ctx context.Context, d orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+func Create[T any](ctx context.Context, d bun.IDB, m *T, label string, opts ...func(*bun.InsertQuery) *bun.InsertQuery) (*T, error) {
 	return crud.Create[T](ctx, d, m, label, opts...)
 }
 
 // Update @notice Replaces every column of the row with m's primary key.
 //
 // @param ctx    the resolver context
-// @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
+// @param d      bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it
 // @param m      the complete model, primary key included; every column is written
 // @param label  names the thing in the not-found message
 // @param opts   query modifiers applied left to right, after WherePK; q.Column(...) narrows the
 // SET clause, q.Where(...) scopes the update to rows the caller owns
 // @return *T    the stored row. See [crud.Update].
 // @return error a *CustomError when no row matched, the bare driver error otherwise
-func Update[T any](ctx context.Context, d orm.DB, m *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error) {
+func Update[T any](ctx context.Context, d bun.IDB, m *T, label string, opts ...func(*bun.UpdateQuery) *bun.UpdateQuery) (*T, error) {
 	return crud.Update[T](ctx, d, m, label, opts...)
 }
 
 // Delete @notice Removes the row with key's primary key, reporting whether one was there.
 //
 // @param ctx    the resolver context
-// @param d      orm.DB — *pg.DB, *pg.Conn and *pg.Tx all satisfy it
+// @param d      bun.IDB — *bun.DB, bun.Conn and bun.Tx all satisfy it
 // @param key    a model with only its primary key populated
 // @param opts   query modifiers applied left to right, after WherePK; this is where an ownership
 // predicate goes
 // @return bool  true when a row was deleted, false when none matched. See [crud.Delete].
 // @return error any driver error
-func Delete[T any](ctx context.Context, d orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (bool, error) {
+func Delete[T any](ctx context.Context, d bun.IDB, key *T, opts ...func(*bun.DeleteQuery) *bun.DeleteQuery) (bool, error) {
 	return crud.Delete[T](ctx, d, key, opts...)
 }

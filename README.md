@@ -8,7 +8,7 @@
 
 Luima connects a [gqlgen](https://github.com/99designs/gqlgen) GraphQL server to
 [Fiber v3](https://github.com/gofiber/fiber) and provides resolver helpers for
-[go-pg](https://github.com/go-pg/pg). Use it when gqlgen, Fiber, and go-pg are already part of
+[bun](https://github.com/uptrace/bun). Use it when gqlgen, Fiber, and bun are already part of
 your application and you want one implementation of their integration and error-handling rules.
 
 ## The problems Luima solves
@@ -19,7 +19,7 @@ your application and you want one implementation of their integration and error-
 | Browser clients use gqlgen's GET, POST, and OPTIONS transports | Registers all three methods and lets gqlgen dispatch them; `CORS` supplies the headers the preflight alone does not |
 | gqlgen's default presenter returns raw resolver errors | Sends explicitly public errors to the client and logs and redacts other resolver errors |
 | CRUD resolvers repeat the same database and GraphQL edge cases | Handles missing rows, duplicate keys, non-nil lists, scoped queries, and `RETURNING *` consistently |
-| `pg.Connect` does not verify a connection immediately | Parses the PostgreSQL URL, opens the pool, and runs a startup query before returning |
+| `sql.OpenDB` dials nothing, and `database/sql` defaults to unlimited connections and two idle | Parses the connection string, sizes the pool for a server, and proves it with a startup query before returning |
 
 **Fiber is a compatibility target, not a performance feature.** gqlgen is an `http.Handler`, so
 luima converts each `*fasthttp.RequestCtx` into an `*http.Request` before gqlgen sees it — gqlgen
@@ -46,7 +46,7 @@ once `RequestTimeout` is disabled — which a subscription requires. See
 
 ## Install
 
-Luima requires Go 1.27. It currently targets Fiber v3, gqlgen v0.17, and go-pg v10.
+Luima requires Go 1.27. It currently targets Fiber v3, gqlgen v0.17, and bun v1.2 with pgdriver.
 
 ```sh
 go get github.com/ulas96/luima
@@ -114,18 +114,29 @@ Create `graph/model/user.go`:
 ```go
 package model
 
+import "github.com/uptrace/bun"
+
 type User struct {
-    tableName  struct{} `pg:"app_users"`
-    PersonalID string   `pg:"personal_id,pk"`
-    Name       string   `pg:"name"`
-    Company    string   `pg:"company"`
-    Projects   []string `pg:"projects,array"`
+    bun.BaseModel `bun:"table:app_users"`
+
+    PersonalID string   `bun:"personal_id,pk"`
+    Name       string   `bun:"name"`
+    Company    string   `bun:"company"`
+    Projects   []string `bun:"projects,array"`
 }
 ```
 
-`Get`, `Update`, and `Delete` call go-pg's `WherePK`, so the `pk` tag is required. Database
-columns must use exported Go fields. The `array` option makes go-pg encode `Projects` as a
-PostgreSQL array instead of JSON.
+The embedded `bun.BaseModel` is what names the table, and it is the line that fails quietly: bun
+skips every unexported field that is not embedded, so a model that names its table the way other
+Postgres mappers do — an unexported `tableName` field — still compiles, and every statement goes
+to `users`, the pluralized type name. `Get`, `Update`, and `Delete` call `WherePK`, so the `pk` tag
+is required. Database columns must use exported Go fields. The `array` option makes bun encode
+`Projects` as a PostgreSQL array instead of JSON, which a `text[]` column rejects with SQLSTATE
+`22P02`. A nil `[]string` is written as literal `NULL`, on insert and on update alike, never as
+the column default — so against the table above it is a `23502`, and `[]string{}` is what writes
+`'{}'`. That reaches resolvers, not only seed scripts and tests: gqlgen unmarshals a nullable
+`[String!]` argument to nil when the client sends null or omits it, and only `[String!]!` is
+always non-nil.
 
 ### 4. Configure and run gqlgen
 
@@ -158,10 +169,10 @@ Create the dependency root in `graph/resolver.go`:
 ```go
 package graph
 
-import "github.com/go-pg/pg/v10"
+import "github.com/uptrace/bun"
 
 type Resolver struct {
-    DB *pg.DB
+    DB *bun.DB
 }
 ```
 
@@ -183,7 +194,7 @@ Fill the generated resolver methods:
 
 ```go
 func (r *queryResolver) Users(ctx context.Context) ([]*model.User, error) {
-    return luima.List[model.User](ctx, r.DB, func(q *orm.Query) *orm.Query {
+    return luima.List[model.User](ctx, r.DB, func(q *bun.SelectQuery) *bun.SelectQuery {
         return q.Order("personal_id").Limit(100)
     })
 }
@@ -206,7 +217,9 @@ func (r *mutationResolver) DeleteUser(ctx context.Context, personalID string) (b
 ```
 
 `List` does not impose an order or row limit; each list resolver must set both. `Update` writes
-every model column unless a query modifier selects specific columns.
+every model column unless a query modifier selects specific columns, and bun writes a zero-valued
+field as its zero value — `''`, `0`, `FALSE` — so a column your input mapper forgets is blanked
+rather than left alone.
 
 Put input-to-model helpers such as `newUser` in `graph/resolver.go`, not a generated
 `*.resolvers.go` file:
@@ -273,7 +286,7 @@ err := luima.Run(ctx, ":8080", luima.Config{
     DisableIntrospection: true,
 
     Health:      "/healthz",
-    HealthCheck: db.Ping,
+    HealthCheck: db.PingContext,
 
     HTTPMiddleware: []func(http.Handler) http.Handler{
         luima.RateLimit(100, time.Minute, nil),
@@ -331,7 +344,7 @@ predicate:
 func (r *mutationResolver) DeleteUser(ctx context.Context, personalID string) (bool, error) {
     ownerID := callerID(ctx)
     return luima.Delete(ctx, r.DB, &model.User{PersonalID: personalID},
-        func(q *orm.Query) *orm.Query {
+        func(q *bun.DeleteQuery) *bun.DeleteQuery {
             return q.Where("owner_id = ?", ownerID)
         })
 }
@@ -406,7 +419,7 @@ so neither adds a dependency, and both stay portable to chi, echo or plain `net/
 | `Configure` | `nil` | `func(*handler.Server)`; runs after Luima configures gqlgen and before mounting |
 | `Fiber` | `fiber.Config{}` | Passed to `fiber.New` by `New`; a field set here wins over `ReadTimeout`/`WriteTimeout`. Ignored by `Mount` |
 | `Health` | `""` | Liveness path, e.g. `/healthz`. Empty disables it; `HTTPMiddleware` does not wrap it |
-| `HealthCheck` | `nil` | `func(context.Context) error`; nil answers 200 while the process is up, an error is 503. Gets a 2s deadline of its own. `db.Ping` fits |
+| `HealthCheck` | `nil` | `func(context.Context) error`; nil answers 200 while the process is up, an error is 503. Gets a 2s deadline of its own. `db.PingContext` fits — `db.Ping` takes no context and does not compile here |
 
 Zero means “use the default” for `RequestTimeout`, `ReadTimeout`, `WriteTimeout`, `QueryCache`,
 `ComplexityLimit` and `MaxDepth`. Use a negative value to disable one of them. `HTTPMiddleware`
@@ -420,11 +433,11 @@ HTTP 200, while parse and validation errors use HTTP 422 — or HTTP 400 when th
 ### CRUD helpers
 
 ```go
-func Get[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (*T, error)
-func List[T any](ctx context.Context, db orm.DB, opts ...func(*orm.Query) *orm.Query) ([]*T, error)
-func Create[T any](ctx context.Context, db orm.DB, model *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error)
-func Update[T any](ctx context.Context, db orm.DB, model *T, label string, opts ...func(*orm.Query) *orm.Query) (*T, error)
-func Delete[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Query) *orm.Query) (bool, error)
+func Get[T any](ctx context.Context, db bun.IDB, key *T, opts ...func(*bun.SelectQuery) *bun.SelectQuery) (*T, error)
+func List[T any](ctx context.Context, db bun.IDB, opts ...func(*bun.SelectQuery) *bun.SelectQuery) ([]*T, error)
+func Create[T any](ctx context.Context, db bun.IDB, m *T, label string, opts ...func(*bun.InsertQuery) *bun.InsertQuery) (*T, error)
+func Update[T any](ctx context.Context, db bun.IDB, m *T, label string, opts ...func(*bun.UpdateQuery) *bun.UpdateQuery) (*T, error)
+func Delete[T any](ctx context.Context, db bun.IDB, key *T, opts ...func(*bun.DeleteQuery) *bun.DeleteQuery) (bool, error)
 ```
 
 | Helper | Result |
@@ -435,15 +448,26 @@ func Delete[T any](ctx context.Context, db orm.DB, key *T, opts ...func(*orm.Que
 | `Update` | Updates by primary key with `RETURNING *`; no match becomes `label + " not found"` |
 | `Delete` | Deletes by primary key; returns `false` when no row matches |
 
-All helpers accept `orm.DB`, which is implemented by `*pg.DB`, `*pg.Conn`, and `*pg.Tx`. Pass a
-transaction to the same helpers inside `RunInTransaction`.
+`Create` and `Update` report absence one way: a row count of zero, with no error. bun turns an
+empty result into `sql.ErrNoRows` only for a `Scan`, or for an `Exec` handed a destination, and
+both helpers `Exec` without one — so a branch on `sql.ErrNoRows` there never runs. `Get` is the one
+that sees it, because a single-row select does scan.
+
+All helpers accept `bun.IDB`, which is implemented by `*bun.DB`, `bun.Conn`, and `bun.Tx`. Pass a
+transaction to the same helpers inside `db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx)
+error)`.
+
+The modifier type is bun's own query for that statement, so there is one per helper. A predicate
+needed by more than one — the ownership `Where` above — is written once as
+`func(bun.QueryBuilder) bun.QueryBuilder` and applied with `q.ApplyQueryBuilder`, which the select,
+update, and delete queries all have.
 
 `Update` is a full replacement by default. Restrict it to selected columns when implementing a
 partial update:
 
 ```go
 updated, err := luima.Update(ctx, db, user, "user "+user.PersonalID,
-    func(q *orm.Query) *orm.Query {
+    func(q *bun.UpdateQuery) *bun.UpdateQuery {
         return q.Column("name", "email")
     })
 ```
@@ -464,8 +488,22 @@ func SQLState(err error) string
 `PresentError` applies these rules:
 
 - `*CustomError`, including when wrapped: sends `UserMessage` to the client.
-- A direct `*gqlerror.Error`: preserves gqlgen's parse or validation message.
+- A direct `*gqlerror.Error` that wraps no other error, reported outside field resolution:
+  preserves gqlgen's parse, validation or limit message.
 - Any other error: logs the error and sends `internal server error`.
+
+The last rule covers everything else reported while a field resolves, whatever its type: a
+resolver's or a directive's error, anything sent with `graphql.AddError` or `graphql.AddErrorf`, a
+panic, and a `*gqlerror.Error` built by your own code — `gqlerror.Errorf(...)`, or a list decoded
+from another GraphQL server. gqlgen wraps a resolver's plain error in a `*gqlerror.Error` before
+the presenter sees it, so the type alone proves nothing. The rule also covers gqlgen's own errors
+from that stage: a null where the schema forbids one, and a client's bad value for a custom scalar
+such as gqlgen's `Time`. (With `DisableIntrospection` set, a `__schema` or `__type` query never
+gets that far: `Mount` refuses the operation first, with `INTROSPECTION_DISABLED` and no log line.) A `*CustomError` is heard from a resolver, a directive or an `UnmarshalGQL` alike, so a
+scalar that should explain its format to the client has to be your own.
+
+Do not share one `*gqlerror.Error` value between requests. gqlgen writes the first request's path
+and locations into it, and two concurrent requests race on it.
 
 Treat `CustomError.UserMessage` as public data. Do not populate it with `err.Error()` or another
 database-derived string. `InternalError` remains available through `errors.Is` and `errors.As`.
@@ -480,35 +518,73 @@ object.
 | `NOT_FOUND` | `Update`, when no row matched |
 | `INTERNAL_SERVER_ERROR` | Every redacted error |
 | `DEPTH_LIMIT_EXCEEDED` | `MaxDepth` |
-| `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`, `COMPLEXITY_LIMIT_EXCEEDED` | gqlgen, passed through unchanged |
+| `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`, `COMPLEXITY_LIMIT_EXCEEDED` | gqlgen, passed through unchanged — except a variable default that does not parse for a custom scalar, which is redacted and still answered HTTP 422 |
 
-Transport-level failures — a malformed body, an unsupported content type — are written by gqlgen's
-transport before an executor exists. They never reach `PresentError`, carry no code, and are not
-redacted.
+Not every response goes through `PresentError`. A request no transport accepts, such as one with an
+unsupported content type, is answered `transport not supported` without it, and so are the GET
+transport's own refusals; neither carries a code. A malformed JSON body does reach it, and passes
+through with no code, quoting the caller's own body back.
 
-`SQLState` returns a PostgreSQL SQLSTATE from a wrapped go-pg error or an empty string when the
-chain contains no `pg.Error`. Common integrity codes are `23505` for a unique violation, `23503`
-for a foreign-key violation, `23502` for a not-null violation, and `23514` for a check violation.
+`SQLState` returns a PostgreSQL SQLSTATE from a wrapped `pgdriver.Error` or an empty string when
+the chain contains none. Common integrity codes are `23505` for a unique violation, `23503` for a
+foreign-key violation, `23502` for a not-null violation, and `23514` for a check violation; `57014`
+is a statement cancelled by `statement_timeout`.
+
+`pgdriver.Error` is a struct value, not a pointer and not an interface, so read it as
+`errors.AsType[pgdriver.Error](err)`. The pointer spelling someone arriving from pgx writes,
+`errors.AsType[*pgdriver.Error]`, compiles and never matches, leaving every SQLSTATE branch behind
+it dead.
 
 ### Database connection
 
 ```go
-func Connect(url string) (*pg.DB, error)
-func ConnectWith(url string, tune func(*pg.Options)) (*pg.DB, error)
-func StatementTimeout(d time.Duration) func(*pg.Options)
+func Connect(url string) (*bun.DB, error)
+func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error)
+func StatementTimeout(d time.Duration) func(*pgdriver.Config)
 ```
 
-`Connect` accepts `postgres://` and `postgresql://` URLs, creates a go-pg pool, and executes
-`select 1` before returning. It closes the pool if the startup query fails. Use
-`sslmode=verify-full` when the server certificate must be verified.
+`Connect` accepts `postgres://` and `postgresql://` URLs, opens a `database/sql` pool over
+pgdriver, and executes `select 1` before returning. It closes the pool if that startup query fails.
+The query is the check: `sql.OpenDB` dials nothing, so without it a wrong credential or a
+misspelled URL parameter surfaces one failed request at a time in production instead of once, at
+boot. `Connect`'s errors carry neither the URL nor its password, so logging one leaks no
+credential.
 
-`ConnectWith` is the same function with a hook onto the parsed `*pg.Options`, for the tuning
-`pg.ParseURL` cannot express — it accepts only `sslmode`, `application_name` and `connect_timeout`.
-`Connect(url)` is `ConnectWith(url, nil)`. `StatementTimeout` is the case worth pre-writing: it
-bounds every query in the server, which a context deadline cannot, because go-pg's cancellation is
-best-effort. A query that exceeds it returns SQLSTATE `57014`. See
-[Deployment](docs/deployment.md) for supported URL parameters, TLS behavior, environment files,
-serving over TLS and behind a proxy, and production database settings.
+pgdriver reads `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `application_name`, `connect_timeout`,
+`dial_timeout`, `timeout`, `read_timeout`, `write_timeout`, and `host` from the URL — `sslcert` and
+`sslkey` only alongside `sslmode` or `sslrootcert`. Every other parameter is sent as
+`SET name TO value` on each new connection, so `?statement_timeout=5s` now works — and a
+misspelled name is not a parse error but a failed startup query, usually SQLSTATE `42704`. With
+`sslmode` absent the connection is still TLS, with nothing verified. Use `sslmode=verify-full` when
+the server certificate must be verified; `verify-ca` checks the host name too, as it did in 0.5.0,
+although pgdriver on its own would check only the chain. `?password=` and `?sslpassword=` are
+refused, because pgdriver would send them to the server as a `SET`, and an integer timeout `<= 0`
+keeps the default. A URL with no database name connects to `$PGDATABASE`, then `postgres`, without
+complaint, and a URL with no password uses `$PGPASSWORD`.
+
+`Connect` sizes the pool, because `database/sql` does not size it for a server: ten connections per
+CPU, open and idle, with a five-minute idle time, which is the pool luima ran before. Resize it on
+the returned handle — `*bun.DB` embeds `*sql.DB` through its state struct, so `SetMaxOpenConns`,
+`SetConnMaxIdleTime`, and `Stats` are promoted onto it. Query hooks go on the handle too:
+`db.WithQueryHook(h)` returns a copy over the same pool, and `AddQueryHook` is deprecated upstream.
+
+`ConnectWith` is the same function with a hook onto the parsed `*pgdriver.Config`, called after the
+URL is applied and before anything dials, for the tuning a connection string cannot express: a
+`*tls.Config` of your own, a dialer, a password or a timeout computed at startup. `Connect(url)` is
+`ConnectWith(url, nil)`. `StatementTimeout` is the case worth pre-writing, and it matters more than
+it used to: pgdriver never asks Postgres to cancel a statement, so a context deadline — including
+the one `RequestTimeout` sets — stops the client waiting while the backend runs the query to
+completion. `statement_timeout` is the only bound the server enforces. A query that exceeds it
+returns SQLSTATE `57014`.
+
+Keep that bound under both client-side deadlines, or its SQLSTATE never arrives: `RequestTimeout`,
+and pgdriver's 10-second socket read timeout, which `Connect` keeps because it is the only bound on
+the reads pgdriver performs without a context — the rows after a query's row description, the
+drain, and `COMMIT`. A statement whose reply takes longer than that fails client-side with an i/o
+timeout whatever `statement_timeout` allows; raise it with `?read_timeout=60s` or in a
+`ConnectWith` tune, and raise `RequestTimeout` with it. See [Deployment](docs/deployment.md) for
+supported URL parameters, TLS behavior, environment files, serving over TLS and behind a proxy, and
+production database settings.
 
 ## Documentation
 
@@ -524,13 +600,14 @@ serving over TLS and behind a proxy, and production database settings.
 ## Development
 
 ```sh
-make test        # run tests; the database-backed CRUD test skips without DATABASE_URL
-make test-db     # load .env and run the database-backed test
+make test        # run tests; the four database-backed tests skip without DATABASE_URL
+make test-db     # load .env and run the database-backed tests
 make lint
 make example     # build the quickstart and reject unimplemented resolver stubs
 ```
 
-`go test ./...` reports success when `TestCRUD` is skipped. To exercise the real driver, set
+`go test ./...` reports success when those four skip — `TestCRUD`, `TestStatementTimeout`,
+`TestStatementTimeoutNegativeDisables` and `TestConnectPoolBound`. To exercise the real driver, set
 `DATABASE_URL`, run the tests with verbose output, and confirm that `TestCRUD` passes rather than
 skips. See [Contributing](CONTRIBUTING.md) for the complete development workflow.
 

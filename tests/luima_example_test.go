@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-pg/pg/v10/orm"
 	"github.com/gofiber/fiber/v3"
+	"github.com/uptrace/bun"
 
 	"github.com/ulas96/luima"
 )
@@ -61,8 +61,12 @@ func ExampleNew_production() {
 // ExampleNew_slowResolvers @notice Raising the bound that actually governs a slow query, and the
 // one that does not.
 //
-// @dev RequestTimeout is the deadline on the resolver's context, which go-pg turns into a socket
-// deadline and a Postgres CancelRequest. It is the one a slow query needs.
+// @dev RequestTimeout is the deadline on the resolver's context, which pgdriver turns into a socket
+// deadline. It is the one a slow query needs, but not the only one: the socket deadline is the
+// earlier of that context's and pgdriver's ReadTimeout, which Connect leaves at 10s. Raise that too
+// — ?read_timeout=60s in the DSN, or a ConnectWith tune — or a 60-second query still fails
+// client-side after 10s. Neither bound stops the statement on the server, because pgdriver never
+// asks Postgres to cancel one, so pair a long RequestTimeout with db.StatementTimeout.
 //
 // WriteTimeout is not a second copy of it. fasthttp starts that deadline after the handler
 // returns, so it bounds writing the response and never the query — raising it to make room for a
@@ -103,12 +107,15 @@ func ExampleMount_authorization() {
 
 	luima.Mount(app, luima.Config{Schema: newStubSchema(), DisablePlayground: true})
 
-	// …and in the resolver, where db is your *pg.DB:
-	deleteUser := func(ctx context.Context, db orm.DB, id string) (bool, error) {
+	// …and in the resolver, where db is your *bun.DB, or the bun.Tx you are inside. The embedded
+	// BaseModel is not optional on an anonymous struct: bun derives a missing table name from the
+	// type's name, and this type has none, so without it the DELETE names no table at all.
+	deleteUser := func(ctx context.Context, db bun.IDB, id string) (bool, error) {
 		owner, _ := ctx.Value(userKey{}).(string)
 		return luima.Delete(ctx, db, &struct {
-			ID string `pg:"id,pk"`
-		}{ID: id}, func(q *orm.Query) *orm.Query {
+			bun.BaseModel `bun:"table:users"`
+			ID            string `bun:"id,pk"`
+		}{ID: id}, func(q *bun.DeleteQuery) *bun.DeleteQuery {
 			return q.Where("owner_id = ?", owner)
 		})
 	}
@@ -171,9 +178,11 @@ func ExampleRun() {
 
 // ExampleRun_health @notice A liveness path for the orchestrator.
 //
-// @dev db.Ping already has the signature HealthCheck wants, so the common case is one field.
-// The context it receives carries a 2s deadline of its own — a probe that inherits the request
-// timeout and hangs for 15s reads to a load balancer as a slow server rather than a broken one.
+// @dev db.PingContext already has the signature HealthCheck wants — *bun.DB embeds *sql.DB through
+// its state struct, which is where it comes from — so the common case is one field. The context it receives carries a 2s
+// deadline of its own, which PingContext honours and db.Ping, taking no context, could not. A probe
+// that inherits the request timeout and hangs for 15s reads to a load balancer as a slow server
+// rather than a broken one.
 //
 // The path is not wrapped by HTTPMiddleware, so a rate limiter cannot 429 the probe.
 func ExampleRun_health() {
@@ -189,7 +198,7 @@ func ExampleRun_health() {
 	if err := luima.Run(ctx, ":8080", luima.Config{
 		Schema:      newStubSchema(),
 		Health:      "/healthz",
-		HealthCheck: db.Ping,
+		HealthCheck: db.PingContext,
 	}); err != nil {
 		log.Print(err)
 	}

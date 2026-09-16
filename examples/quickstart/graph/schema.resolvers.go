@@ -8,10 +8,10 @@ package graph
 import (
 	"context"
 
-	"github.com/go-pg/pg/v10/orm"
 	"github.com/ulas96/luima"
 	"github.com/ulas96/luima/examples/quickstart/graph/generated"
 	"github.com/ulas96/luima/examples/quickstart/graph/model"
+	"github.com/uptrace/bun"
 )
 
 // CreateUser is the resolver for the createUser field.
@@ -31,7 +31,7 @@ func (r *mutationResolver) DeleteUser(ctx context.Context, personalID string) (b
 
 // Users is the resolver for the users field.
 func (r *queryResolver) Users(ctx context.Context) ([]*model.User, error) {
-	return luima.List[model.User](ctx, r.DB, func(q *orm.Query) *orm.Query {
+	return luima.List[model.User](ctx, r.DB, func(q *bun.SelectQuery) *bun.SelectQuery {
 		return q.Order("personal_id").Limit(100)
 	})
 }

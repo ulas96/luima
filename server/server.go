@@ -69,24 +69,43 @@ type Config struct {
 	// validation errors (gqlparser/validator/core/helpers.go), and PresentError passes
 	// validation errors through by design, so a caller who guesses "nam" still learns there is
 	// a "name". Do not treat it as a substitute for authorization.
+	//
+	// With it set, an operation that selects __schema or __type is refused before any field
+	// runs: "introspection is disabled", INTROSPECTION_DISABLED in extensions, HTTP 200, and no
+	// log line, like a depth rejection. gqlgen's own gate, which reports the same thing as a
+	// plain error from resolving the field and so reads as INTERNAL_SERVER_ERROR, stays behind it.
 	DisableIntrospection bool
 
 	// RequestTimeout @notice Deadline for the whole request, propagated into the resolver
 	// context. Default 15s. Negative disables it.
 	//
-	// @dev Zero means "unset", as with QueryCache. This is the only bound a query gets:
-	// go-pg sets no ReadTimeout or WriteTimeout default, pg.ParseURL rejects statement_timeout
-	// in the DSN, and nothing else in the stack imposes one. What makes a context deadline
-	// sufficient is that go-pg honours it three ways — the pool wait selects on ctx.Done()
-	// (internal/pool/pool.go waitTurn), the socket deadline is ctx.Deadline() verbatim when no
-	// ReadTimeout is set (internal/pool/conn.go deadline), and ctx.Done() triggers a real
-	// Postgres CancelRequest against the running backend (base.go withConn).
+	// @dev Zero means "unset", as with QueryCache. This deadline is what the database layer stops
+	// waiting on, in three places. database/sql has no pool timeout of its own, so a request queued
+	// for a pooled connection gives up only when its context is done ((*sql.DB).conn selects on
+	// ctx.Done()); under a saturated pool, this is what turns the queue into 408s. pgdriver
+	// sets the socket deadline to the earlier of ctx.Deadline() and its own ReadTimeout or
+	// WriteTimeout ((*pgdriver.Conn).deadline), but only while it writes the query and reads the
+	// reply — all of it for an Exec such as Delete, and up to the row description for a query such
+	// as Get, List, Create or Update. And the rows after that, which pgdriver reads on
+	// context.TODO(), are watched by database/sql itself: it closes the Rows when the context fires
+	// and stores ctx.Err() for Rows.Err() ((*sql.Rows).awaitDone). Only COMMIT and ROLLBACK, which
+	// run on context.Background(), and a connection dialed in the background
+	// ((*sql.DB).openNewConnection), which carries no request context at all, are bounded by
+	// pgdriver's timeouts alone. Postgres holds back a small result until the statement finishes,
+	// so for single-row CRUD the whole wait normally falls inside the context-bounded read.
 	//
-	// 15s is deliberately under go-pg's own 30s PoolTimeout default (options.go init): below
-	// it, a saturated pool sheds deterministic 408s; at or above it, the failure mode is a coin
-	// flip between ErrPoolTimeout and the timeout. That CancelRequest is best-effort — it dials
-	// a second connection and only logs a failure — so a server-authoritative bound still wants
-	// statement_timeout via pg.Options.OnConnect. See SECURITY.md.
+	// That ReadTimeout is also a ceiling this field cannot lift. Connect keeps pgdriver's 10s
+	// default, so a statement whose response takes longer fails client-side with an i/o timeout
+	// however high RequestTimeout is: raise both together, with ?read_timeout=60s in the DSN or a
+	// ConnectWith tune. A socket timeout closes the connection as well — on the context-bounded
+	// read, (*pgdriver.Conn).checkBadConn counts any error that is not a pgdriver.Error as a bad
+	// connection, and on a later one pgdriver's rows.Close closes it — so each one costs the pool
+	// a reconnect.
+	//
+	// None of this stops the query. pgdriver never asks Postgres to cancel a statement: it keeps
+	// the backend's cancel key from startup and never sends it. A statement whose client timed out
+	// runs on, so statement_timeout — db.StatementTimeout, or ?statement_timeout= in the DSN — is
+	// the only bound Postgres enforces on it. See SECURITY.md.
 	RequestTimeout time.Duration
 
 	// ReadTimeout @notice How long a client may take to send a whole request. Default 10s.
@@ -216,11 +235,12 @@ type Config struct {
 	// returns nil, and so does the timeout middleware on both its normal and its timed-out
 	// path, so no resolver error ever becomes a Fiber error.
 	//
-	// ErrorPresenter is the only contract for errors a *resolver* returns. Transport-level
-	// failures — a malformed JSON body, an unsupported content type — are written by gqlgen's
-	// transport before any executor exists, so they never reach the presenter and are not
-	// redacted; a malformed body is echoed back in the message. Nothing sensitive of the
-	// server's is in that path, but the claim that everything goes through the presenter is
+	// ErrorPresenter is the only contract for errors a *resolver* returns. It does not see every
+	// error on the wire: a request no transport accepts, such as one with an unsupported content
+	// type, is answered "transport not supported" by handler.Server.ServeHTTP without it. A
+	// malformed JSON body does reach it, through Executor.DispatchError, and passes through as
+	// gqlgen's own text with the body echoed back in the message. Nothing sensitive of the
+	// server's is in either path, but the claim that everything goes through the presenter is
 	// not one to build on.
 	Fiber fiber.Config
 
@@ -238,13 +258,18 @@ type Config struct {
 	// HealthCheck @notice What Health calls. Nil means the path answers 200 whenever the process
 	// is up. A non-nil error is 503, and the error text is not sent to the client.
 	//
-	// @dev A function rather than a *pg.DB field, for three reasons that all point the same way:
-	// this package does not import go-pg today and this would be the only reason to start, luima
+	// @dev A function rather than a *bun.DB field, for three reasons that all point the same way:
+	// this package does not import bun today and this would be the only reason to start, luima
 	// would otherwise have to answer who closes the pool, and a real deployment checks more than
-	// one thing. go-pg's Ping already has this exact signature (go-pg/base.go:508, promoted onto
-	// *pg.DB), so the common case is:
+	// one thing. *bun.DB embeds *sql.DB through its state struct, and database/sql's PingContext
+	// already has this exact signature, so the common case is:
 	//
-	//	HealthCheck: db.Ping
+	//	HealthCheck: db.PingContext
+	//
+	// PingContext, never Ping — and db.Ping does not compile here, which is the right outcome:
+	// database/sql's Ping takes no context and runs on context.Background(), so it would ignore
+	// the deadline below. PingContext honours it: the wait for a pooled connection gives up when it
+	// expires, and pgdriver's SELECT 1 is written and read under it.
 	//
 	// The context passed in carries a 2s deadline of its own, and that is the point of the field
 	// rather than a detail of it. A liveness probe against a wedged database must answer 503; a
@@ -397,9 +422,10 @@ func Mount(r fiber.Router, cfg Config) {
 		endpoint = "/graphql"
 	}
 
-	// Not handler.NewDefaultServer: deprecated in v0.17.94, and it gives no way to set an
-	// error presenter, which makes luimaerr.PresentError impossible. Everything it would have added is
-	// spelled out below.
+	// Not handler.NewDefaultServer: deprecated in v0.17.94, and it registers a transport and
+	// extension set luima has to choose for itself — transport.MultipartForm (the CSRF hole of
+	// gotcha #37), transport.Websocket and APQ — with every transport registered before any
+	// Configure could run. Everything it would have added is spelled out below.
 	srv := handler.New(cfg.Schema)
 
 	if n := cfg.QueryCache; n >= 0 {
@@ -412,6 +438,8 @@ func Mount(r fiber.Router, cfg Config) {
 	// handler.New adds no extensions; without this the playground's docs pane is blind.
 	if !cfg.DisableIntrospection {
 		srv.Use(extension.Introspection{})
+	} else {
+		srv.Use(noIntrospection{})
 	}
 	if n := cfg.ComplexityLimit; n >= 0 {
 		if n == 0 {
@@ -545,7 +573,7 @@ func Mount(r fiber.Router, cfg Config) {
 //
 // Drop the locals fallback and every consumer passing identity through c.Locals gets a silent nil
 // in the resolver — no compile error, no log line, and c.Locals is the only mechanism that worked
-// before this change. TestMountRoutes/"c.Locals reaches the resolver" pins it.
+// before this change. TestResolverContext/"c.Locals reaches the resolver" pins it.
 type fiberContext struct {
 	context.Context
 	locals context.Context
@@ -566,9 +594,18 @@ func (c fiberContext) Value(key any) any {
 // @dev fasthttpadaptor hands a net/http handler the *fasthttp.RequestCtx as its request context.
 // That satisfies context.Context only nominally: Deadline reports nothing, and Done is closed on
 // server shutdown rather than on the client hanging up ("creating a new channel for every request
-// is just too expensive", fasthttp/server.go). Three things follow, and all three are silent —
-// a client disconnect does not stop the query, no middleware can impose a deadline, and any
-// resolver code that respects cancellation is dead code that reads as correct.
+// is just too expensive", fasthttp/server.go). Two things follow, and both are silent — a deadline
+// set on the Fiber side, which is how timeout.New applies RequestTimeout (c.SetContext), never
+// reaches the resolver, and any resolver code that respects cancellation is dead code that reads
+// as correct. What an HTTPMiddleware entry does is still its own: context.WithTimeout plus
+// r.WithContext imposes a deadline whatever the context it started from reported.
+//
+// What this does not buy is noticing a client that hangs up. Fiber's context is
+// context.Background() until middleware replaces it ((*fiber.DefaultCtx).Context), and nothing
+// cancels it on a disconnect either, so an abandoned request runs until it finishes or its
+// deadline expires. Nor would a cancellation stop a query: pgdriver never asks Postgres to cancel
+// a statement, and its reads and writes see a context's deadline, never its cancellation
+// ((*pgdriver.Conn).deadline).
 //
 // HTTPHandlerWithContext stashes Fiber's own request context as a fasthttp user value; this
 // unwraps it so gqlgen — and every resolver under it — sees a context that actually cancels and
