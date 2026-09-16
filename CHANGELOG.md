@@ -113,9 +113,11 @@ against a table that already holds rows.
   - Your own `go.mod` swaps `github.com/go-pg/pg/v10` for `github.com/uptrace/bun`, plus
     `driver/pgdriver` wherever you name `ConnectWith`'s tune type. The graph gains
     `go.opentelemetry.io/otel` indirectly as well, because pgdriver sets `EnableTracing: true` in
-    `newDefaultConfig` and opens a span per statement — a no-op until you install a provider, and
-    `c.EnableTracing = false` in a `ConnectWith` tune if you would rather it were not there. It is
-    not a DSN parameter: `?tracing=false` would become a `SET` and fail 42704.
+    `newDefaultConfig`, and with it `(*Conn).trace` adds `db.user`, `db.name` and `server.address`
+    to whatever span is already recording in a query's context. It starts no span of its own —
+    per-statement spans are `bunotel`'s job — and `c.EnableTracing = false` in a `ConnectWith` tune
+    turns even the attributes off. It is not a DSN parameter: `?tracing=false` would become a `SET`
+    and fail 42704.
 
 - **Stored data changes shape: bun writes a zero-valued field as that zero value.** go-pg sent
   `DEFAULT` on insert and `NULL` on update for anything zero unless the field was tagged
