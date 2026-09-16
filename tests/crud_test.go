@@ -238,6 +238,49 @@ func TestCRUD(t *testing.T) {
 	t.Run("suppressed conflict", func(t *testing.T) { testSuppressedConflict(ctx, t, conn) })
 	t.Run("swallowed by trigger", func(t *testing.T) { testSwallowedByTrigger(ctx, t, conn) })
 	t.Run("nil slice", func(t *testing.T) { testNilSlice(ctx, t, conn) })
+	t.Run("unknown column", func(t *testing.T) { testUnknownColumn(ctx, t, conn) })
+}
+
+// testUnknownColumn @notice Asserts Create and Update succeed against a table holding a column the
+// model does not declare.
+//
+// @dev That table is the deploy order every additive migration uses: the column first, the code
+// that maps it after. In between, RETURNING * hands back a column testUser has no field for, and
+// bun's (*structTableModel).ScanColumn refuses it — "bun: testUser does not have column" — unless
+// the DB was built WithDiscardUnknownColumns. The statement has already committed by then, so
+// Create answers a stored row with a redacted error, and the client's retry gets a CONFLICT. bun
+// reads the flag from the DB alone — go-pg's per-model discard_unknown_columns tag only logs a WARN
+// — so ConnectWith is the one place it can be set.
+//
+// Last in TestCRUD, because the column stays until the cleanup drops it.
+//
+// @param ctx  the query context
+// @param t    the test handle
+// @param conn the live pool
+func testUnknownColumn(ctx context.Context, t *testing.T, conn *bun.DB) {
+	t.Helper()
+
+	if _, err := conn.ExecContext(ctx, "alter table luima_test_users add column added_later text not null default 'x'"); err != nil {
+		t.Fatal(err)
+	}
+	const id = "unknown-column-1"
+	t.Cleanup(func() {
+		if _, err := crud.Delete(ctx, conn, &testUser{PersonalID: id}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := conn.ExecContext(ctx, "alter table luima_test_users drop column added_later"); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	created, err := crud.Create(ctx, conn, &testUser{PersonalID: id, Name: "Ada", Projects: []string{}}, "user "+id)
+	if err != nil || created == nil {
+		t.Fatalf("Create against a table with a column the model lacks = %+v, %v — the row was stored either way", created, err)
+	}
+	updated, err := crud.Update(ctx, conn, &testUser{PersonalID: id, Name: "Grace", Projects: []string{}}, "user "+id)
+	if err != nil || updated == nil || updated.Name != "Grace" {
+		t.Fatalf("Update against a table with a column the model lacks = %+v, %v", updated, err)
+	}
 }
 
 // testSuppressedConflict @notice Asserts an insert the caller asked Postgres to skip comes back as

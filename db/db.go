@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	neturl "net/url"
+	"os"
 	"regexp"
 	"runtime"
 	"strings"
@@ -34,28 +35,33 @@ import (
 //     ?statement_timeout=5s works, and a misspelled parameter is not a parse error: it fails the
 //     boot round trip instead — 42704 for an unknown name, 42601 for a key such as a-b — or, for a
 //     dotted name such as app.x, which Postgres takes as a custom setting, never fails at all.
-//     sslcert and sslkey are read only alongside sslmode or sslrootcert; without either they are
-//     sent as SET and fail with 42704. ?host= is dialed as written, with no port added. And a
-//     timeout written as an integer <= 0 is not "no timeout": queryOptions.duration turns it into
-//     -1ns, so ?connect_timeout=0 fails every dial at once and ?read_timeout=0 every read.
+//     Two names are refused while parsing instead, password and sslpassword: sent as SET, their
+//     value would reach the server log in the statement Postgres rejects (see connector). sslcert
+//     and sslkey are read only alongside sslmode or sslrootcert; without either they are sent as
+//     SET and fail with 42704. ?host= is dialed as written, with no port added. A timeout written
+//     as an integer <= 0, which queryOptions.duration turns into -1ns — a deadline that has
+//     already passed — is read as unset, and keeps pgdriver's default, as 0.5.0 read
+//     ?connect_timeout=0.
 //   - TLS. With sslmode absent, allow or prefer, the connection is TLS with InsecureSkipVerify: a
 //     managed Postgres connects with nothing to configure, and nothing is verified, sslrootcert or
 //     not. require is just as unverified, unless sslrootcert is given too, when it acts as
-//     verify-ca. verify-ca verifies the certificate chain, against sslrootcert or the system roots,
-//     but not the host name, so any certificate those roots trust passes, whatever host it names;
-//     0.5.0 checked the host name here too, and verify-full is how to keep that. verify-full
-//     verifies both, against a ServerName pgdriver sets from the host in the URL's authority,
-//     without its port. A host given only as ?host= leaves ServerName empty, and crypto/tls then
-//     refuses every verify-full handshake before sending it; set c.TLSConfig.ServerName in a
-//     ConnectWith tune for that. disable is plaintext. In every mode but disable a server that
-//     refuses TLS is an error, never a plaintext fallback, so a Postgres without TLS — a CI
-//     container, a unix socket — needs ?sslmode=disable.
+//     verify-ca. verify-ca and verify-full both verify the certificate chain, against sslrootcert
+//     or the system roots, and the host name, against a ServerName pgdriver sets from the host in
+//     the URL's authority, without its port. That is 0.5.0's verify-ca, not libpq's: pgdriver
+//     checks verify-ca's chain alone, and connector hands it back to crypto/tls's full check. A
+//     host given only as ?host= leaves ServerName empty, and crypto/tls then refuses every
+//     verify-ca and verify-full handshake before sending it; set c.TLSConfig.ServerName in a
+//     ConnectWith tune for that, or a VerifyConnection of your own for a chain-only check. disable
+//     is plaintext. In every mode but disable a server that refuses TLS is an error, never a
+//     plaintext fallback, so a Postgres without TLS — a CI container, a unix socket — needs
+//     ?sslmode=disable.
 //   - Defaults. A DSN with no host dials $PGHOST and $PGPORT, then localhost and 5432. A host name
 //     or IPv4 address with no port gets 5432, whatever $PGPORT says, but an IPv6 literal gets no
 //     port at all — parseDSN adds one only to a host without a colon — so [::1] fails to dial with
 //     "missing port in address" until it is written [::1]:5432. No user is $PGUSER, then postgres;
 //     no database is $PGDATABASE, then postgres, and that one is silent: a DSN that forgot its
-//     database connects to postgres. $PGPASSWORD is not read.
+//     database connects to postgres. No password is $PGPASSWORD, which pgdriver does not read and
+//     connector does, as 0.5.0 did.
 //
 // postgres://, postgresql:// and unix:///path/to/socket all parse.
 //
@@ -161,7 +167,13 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 	sqldb.SetMaxOpenConns(n)
 	sqldb.SetMaxIdleConns(n)
 	sqldb.SetConnMaxIdleTime(5 * time.Minute)
-	db := bun.NewDB(sqldb, pgdialect.New())
+	// WithDiscardUnknownColumns, because crud.Create and crud.Update read RETURNING * into the
+	// model. Without it a column the model does not declare — one a migration added before the
+	// deploy that maps it — fails the scan with "bun: T does not have column" after the statement
+	// has already committed, and the client's retry of a stored row gets a CONFLICT. bun reads the
+	// flag from the DB alone: go-pg's per-model discard_unknown_columns tag only logs a WARN now,
+	// and the flag cannot be set on a handle this function has already built.
+	db := bun.NewDB(sqldb, pgdialect.New(), bun.WithDiscardUnknownColumns())
 
 	// sql.OpenDB and bun.NewDB dial nothing — pgdialect's Init is empty. This round trip is what
 	// proves the host, the TLS mode, the credentials and every ConnParams SET. Without it a bad
@@ -173,9 +185,9 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 	// the earlier of its deadline and now+ReadTimeout ((*Conn).deadline). At the 5s default that
 	// is this context's, under the 10s ReadTimeout, so it is one bound on the whole round trip —
 	// what ?connect_timeout=N reads as if it means. Raised past ReadTimeout, it still bounds the
-	// total while ReadTimeout caps each read. A DialTimeout of 0, which tune can set, falls back to
-	// 5s here; a negative one, which is what ?connect_timeout=0 parses to, fails the dial at once
-	// whatever this says, because net.Dialer's deadline method adds a negative Timeout too.
+	// total while ReadTimeout caps each read. A DialTimeout of 0 or less, which only tune can set —
+	// connector turns the DSN's back into the default — falls back to 5s here; a negative one still
+	// fails the dial at once, because net.Dialer's deadline method adds a negative Timeout too.
 	timeout := cfg.DialTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second // pgdriver's own DialTimeout default, in newDefaultConfig
@@ -191,9 +203,10 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 }
 
 // connector @notice Parses url into the pgdriver connector ConnectWith opens its pool over, with
-// an error where pgdriver would panic and neither url nor its password in any error.
+// an error where pgdriver would panic, neither url nor its password in any error, and the DSN read
+// the way 0.5.0 read it where pgdriver reads it otherwise.
 //
-// @dev Three guards, and pgdriver forces all three:
+// @dev Guards first, and pgdriver forces all of them:
 //
 //   - The cut-short user info. An unescaped / ? or # in a password ends the URL's authority early,
 //     and url.Parse accepts what is left whenever it still reads as a host and port.
@@ -205,29 +218,101 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 //     the password: "dial tcp 127.0.0.1:2024: connect: connection refused", "lookup ss: no such
 //     host". What every such DSN has, and a well-formed one almost never does, is the @ that should
 //     have ended the user info outside the authority, in the path, query or fragment; one that
-//     means it can write it as %40. This check runs ahead of the other two because its error
-//     quotes nothing, and redact's password check would withhold it whenever what is left of the
-//     password is short enough to occur in its wording.
-//   - The recover. OpenConnector returns parseDSN's error instead of panicking with it, but
-//     parseDSN builds its options as it goes, and WithUser panics on an empty name — so
-//     postgres://:secret@host/db and postgres://@host/db panic out of the very call that validates.
-//     (WithAddr, WithDatabase and WithNetwork panic on "" too; parseDSN never passes them one.)
-//     NewConnector is guarded as well, because WithDSN parses again and panics with any error it
-//     gets, and a sslrootcert, sslcert or sslkey file that changes between the two parses fails
-//     there. Connect must not panic: a panic skips the caller's error handling, and a crash prints
-//     the panic's value, which from WithDSN is parseDSN's error before any redaction.
-//   - The redaction, in every error that leaves: see redact.
+//     means it can write it as %40. This check, and the next, run outside openConnector because
+//     their errors quote nothing, and redact's password check would withhold them whenever the
+//     password is short enough to occur in their wording.
+//   - ?password= and ?sslpassword=. libpq reads both; pgdriver reads neither, so each becomes a
+//     ConnParams entry that newConn sends as SET password TO 'value' once authentication has
+//     succeeded without it — trust, peer, a certificate, or the same password in the user info.
+//     Postgres refuses the SET with 42704 and, at the default log_min_error_statement, writes the
+//     statement to the server log, value and all, where luima's redaction never reaches. The key
+//     is compared as Postgres compares a setting name: without case, and without quotes.
+//   - The recover and the redaction: see openConnector.
+//
+// Then three corrections, each where pgdriver departs from what a DSN meant under 0.5.0:
+//
+//   - verify-ca checks the host name. pgdriver implements it as libpq does, a VerifyPeerCertificate
+//     callback over the chain with InsecureSkipVerify set, and uses the same callback for require
+//     with an sslrootcert; that callback is the only one parseDSN installs. Clearing both hands
+//     the connection back to crypto/tls, which verifies the same RootCAs and the ServerName
+//     parseDSN already set. 0.5.0's verify-ca was that check, so a DSN carried over is not quietly
+//     weaker; a chain-only check is still a tune away, as a VerifyConnection of your own.
+//   - A negative timeout is unset. queryOptions.duration answers -1 for an integer <= 0, meaning
+//     "disabled", and pgdriver then adds it to now: every dial, read or write gets a deadline
+//     already passed. pgdriver's own defaults go back in, which is what 0.5.0 made of
+//     ?connect_timeout=0, and what luima's zero-is-unset rule makes of it. Zero itself — no
+//     deadline — stays reachable from tune, where Connect's warning about it is.
+//   - $PGPASSWORD fills an empty password. go-pg read it; pgdriver reads $PGHOST, $PGPORT, $PGUSER
+//     and $PGDATABASE, and not it.
+//
+// Before tune, all of it, so tune still wins.
 //
 // @param url                  the connection string, as ConnectWith takes it
 // @return *pgdriver.Connector the connector, holding the live *pgdriver.Config; nil on error
 // @return error               "parse database url: ...", with url and its password redacted
-func connector(url string) (c *pgdriver.Connector, err error) {
-	if u, perr := neturl.Parse(url); perr == nil &&
-		strings.Contains(u.Opaque+u.EscapedPath()+u.RawQuery+u.EscapedFragment(), "@") {
+func connector(url string) (*pgdriver.Connector, error) {
+	u, err := neturl.Parse(url)
+	if err == nil && strings.Contains(u.Opaque+u.EscapedPath()+u.RawQuery+u.EscapedFragment(), "@") {
 		return nil, errors.New("parse database url: the user info ends before its @ " +
 			"(percent-encode any / ? # or % in the user or password, and write any @ past the host as %40)")
 	}
+	if err == nil {
+		for k := range u.Query() {
+			if n := strings.ToLower(strings.Trim(k, `"`)); n == "password" || n == "sslpassword" {
+				return nil, errors.New("parse database url: ?" + n + "= is not read by pgdriver, which would send it " +
+					"to the server as a SET (put the password in the user info, or set it in a ConnectWith tune)")
+			}
+		}
+	}
 
+	c, err := openConnector(url)
+	if err != nil {
+		return nil, err
+	}
+	cfg := c.Config()
+
+	if t := cfg.TLSConfig; t != nil && t.VerifyPeerCertificate != nil {
+		t.InsecureSkipVerify = false
+		t.VerifyPeerCertificate = nil
+	}
+
+	def := pgdriver.NewConnector().Config()
+	if cfg.DialTimeout < 0 {
+		cfg.DialTimeout = def.DialTimeout
+	}
+	if cfg.ReadTimeout < 0 {
+		cfg.ReadTimeout = def.ReadTimeout
+	}
+	if cfg.WriteTimeout < 0 {
+		cfg.WriteTimeout = def.WriteTimeout
+	}
+
+	if cfg.Password == "" {
+		cfg.Password = os.Getenv("PGPASSWORD")
+	}
+	return c, nil
+}
+
+// openConnector @notice pgdriver's own DSN parse, with an error where it would panic and neither
+// url nor its password in the error.
+//
+// @dev OpenConnector returns parseDSN's error instead of panicking with it, but parseDSN builds its
+// options as it goes, and WithUser panics on an empty name — so postgres://:secret@host/db and
+// postgres://@host/db panic out of the very call that validates. (WithAddr, WithDatabase and
+// WithNetwork panic on "" too; parseDSN never passes them one.) Connect must not panic: a panic
+// skips the caller's error handling, and a crash prints the panic's value before any redaction.
+//
+// The connector OpenConnector returns is the one to keep. It is NewConnector(opts...) behind the
+// driver.Connector interface, so the assertion cannot fail, and keeping it parses the DSN once:
+// building a second one with NewConnector(WithDSN(url)) would parse it again, read the sslrootcert,
+// sslcert and sslkey files again, and panic inside WithDSN if one of them changed in between.
+// WithDSN's options alone, too, with no WithReadTimeout(0) or WithWriteTimeout(0): pgdriver's 10s
+// and 5s are the only deadline on the reads and writes it does without a context. See Connect.
+//
+// @param url                  the connection string, as ConnectWith takes it
+// @return *pgdriver.Connector the connector parseDSN's options built; nil on error
+// @return error               "parse database url: ...", from redact
+func openConnector(url string) (c *pgdriver.Connector, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			perr, ok := r.(error)
@@ -241,12 +326,11 @@ func connector(url string) (c *pgdriver.Connector, err error) {
 		}
 	}()
 
-	if _, err = pgdriver.NewDriver().OpenConnector(url); err != nil {
+	dc, err := pgdriver.NewDriver().OpenConnector(url)
+	if err != nil {
 		return nil, err
 	}
-	// WithDSN alone, with no WithReadTimeout(0) or WithWriteTimeout(0) ahead of it: pgdriver's 10s
-	// and 5s are the only deadline on the reads and writes it does without a context. See Connect.
-	return pgdriver.NewConnector(pgdriver.WithDSN(url)), nil
+	return dc.(*pgdriver.Connector), nil
 }
 
 // redact @notice Builds ConnectWith's parse error from pgdriver's, without the DSN or its password.

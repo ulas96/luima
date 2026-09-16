@@ -556,10 +556,11 @@ pgdriver reads `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `application_name`
 `SET name TO value` on each new connection, so `?statement_timeout=5s` now works — and a
 misspelled name is not a parse error but a failed startup query, usually SQLSTATE `42704`. With
 `sslmode` absent the connection is still TLS, with nothing verified. Use `sslmode=verify-full` when
-the server certificate must be verified: under pgdriver `verify-ca` verifies the chain and not the
-host name — the behaviour the name describes, and not 0.5.0's, which checked the host name here
-too. A URL with no database name connects to `$PGDATABASE`, then `postgres`, without complaint, and
-`$PGPASSWORD` is never read.
+the server certificate must be verified; `verify-ca` checks the host name too, as it did in 0.5.0,
+although pgdriver on its own would check only the chain. `?password=` and `?sslpassword=` are
+refused, because pgdriver would send them to the server as a `SET`, and an integer timeout `<= 0`
+keeps the default. A URL with no database name connects to `$PGDATABASE`, then `postgres`, without
+complaint, and a URL with no password uses `$PGPASSWORD`.
 
 `Connect` sizes the pool, because `database/sql` does not size it for a server: ten connections per
 CPU, open and idle, with a five-minute idle time, which is the pool luima ran before. Resize it on

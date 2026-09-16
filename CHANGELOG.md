@@ -67,7 +67,12 @@ against a table that already holds rows.
     byte-identical to go-pg's, so an untagged field still derives the same column. `,pk` and
     `,array` carry over as written. `,use_zero` has no bun spelling, because it is bun's behaviour
     now — leave it in place and bun prints one `has unknown tag option: "use_zero"` WARN per field
-    the first time it builds that model's table.
+    the first time it builds that model's table. `discard_unknown_columns` on the table tag has no
+    bun spelling either, and only WARNs: bun reads that switch from the `*bun.DB`, and
+    `ConnectWith` now builds every handle with `bun.WithDiscardUnknownColumns()`, so a column your
+    model does not declare is ignored for every model. Without it, `RETURNING *` in `Create` and
+    `Update` failed the scan with `bun: T does not have column` after the statement had committed —
+    a stored row answered as an error, and the client's retry answered `CONFLICT`.
   - **`tableName struct{}` `pg:"app_users"` → an embedded `bun.BaseModel` tagged
     `bun:"table:app_users"`. This is the one that fails quietly.** bun reads the table name from
     the embedded `BaseModel` and from nowhere else, and it skips every unexported field that is not
@@ -180,24 +185,24 @@ against a table that already holds rows.
   made anything else a parse error. So `?statement_timeout=5s` now works — and a misspelled name
   is no longer caught while parsing: it fails `Connect`'s boot round trip instead, as 42704 for an
   unknown setting, or 42601 for a key such as `a-b`, or never at all for a dotted name such as
-  `app.x`, which Postgres takes as a custom setting. One parameter that does carry over changed
-  meaning: a timeout written as a plain integer `0` or less is now a *disabled* timeout rather than
-  an unset one — `(*queryOptions).duration` answers `-1` — so `?connect_timeout=0`, libpq's spelling
-  for "no timeout", fails every dial before it starts, where `pg.ParseURL` read it as the 5s
-  default. Written as a duration, `0s` is still ignored. Two more silences to know about: a DSN
-  with no database name connects to `$PGDATABASE`, then `postgres`, where the old parser refused
-  it; and `$PGPASSWORD` is not read at all, where go-pg read it (`$PGHOST`, `$PGPORT`, `$PGUSER` and
-  `$PGDATABASE` are). Set `application_name` and check `pg_stat_activity` if you want to see which
+  `app.x`, which Postgres takes as a custom setting. Two names are refused while parsing, in any
+  case: `?password=` and `?sslpassword=`, which libpq reads and pgdriver does not — sent as a `SET`,
+  Postgres rejects the statement and, at the default `log_min_error_statement`, logs it with the
+  value in it. A timeout written as a plain integer `0` or less still means the default, as
+  `pg.ParseURL` read `?connect_timeout=0`: pgdriver's `(*queryOptions).duration` answers `-1`, a
+  deadline already passed, and `Connect` puts pgdriver's default back. `$PGPASSWORD` still fills a
+  DSN with no password — `Connect` reads it, since pgdriver does not — but there is no further
+  fallback to `postgres`, as go-pg had. One more silence to know about: a DSN with no database name
+  connects to `$PGDATABASE`, then `postgres`, where the old parser refused it. Set `application_name` and check `pg_stat_activity` if you want to see which
   database and user you actually got. `docs/deployment.md` walks the whole DSN.
 
-- **`?sslmode=verify-ca` no longer verifies the host name.** go-pg treated `verify-ca` as
-  `verify-full`; pgdriver implements the mode as specified, verifying the certificate chain with a
-  `VerifyPeerCertificate` that deliberately does not check the DNS name (`tls.Config` has no option
-  for chain-only verification). Any certificate your roots trust now passes, whatever host it
-  names — which is a downgrade for anyone who had `verify-ca` in a DSN believing otherwise.
-  **Migration:** write `?sslmode=verify-full`. `?sslmode=require` with an `sslrootcert` is the same
-  chain-only check, by pgdriver's own documented fallthrough. `docs/deployment.md` has the mode
-  table.
+- **`?sslmode=verify-ca` still verifies the host name, though pgdriver's does not.** go-pg treated
+  `verify-ca` as `verify-full`; pgdriver implements libpq's meaning, a `VerifyPeerCertificate` that
+  checks the chain and deliberately not the DNS name, and uses it for `?sslmode=require` with an
+  `sslrootcert` too. `Connect` hands both back to crypto/tls's full check, so a `verify-ca` DSN
+  carried over is not quietly weaker, and `require` with an `sslrootcert` — which `0.5.0` refused —
+  verifies as much. A chain-only check is a `VerifyConnection` of your own in a `ConnectWith` tune.
+  `docs/deployment.md` has the mode table.
 
 - **The pool is `database/sql`'s, and `Connect` sizes it.** `database/sql` defaults to unlimited
   open connections and two idle (`defaultMaxIdleConns`), which turns a burst of requests into a

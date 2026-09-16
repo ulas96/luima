@@ -37,11 +37,17 @@ a round trip at all. The dotted name has nothing to fail: if you rely on one, re
 at them inside that branch. Given on their own they are left over like any other parameter, go out
 as `SET`s, and fail 42704.
 
-An integer timeout is a count of seconds, and one that is **`<= 0` is not "no timeout"**:
-`queryOptions.duration` turns it into `-1`, so `?connect_timeout=0` fails every dial at once and
-`?read_timeout=0` every read. Written as a duration, `?read_timeout=0s` parses to zero, which
-`parseDSN` skips — leaving pgdriver's default in place. Two spellings of one intent that do
-opposite things.
+`password` and `sslpassword` are refused at parse, in any letter case. pgdriver reads neither, so
+each would go out as `SET password TO '…'`, which Postgres rejects — and logs, value and all, at the
+default `log_min_error_statement`. Put the password in the user info, percent-encoded, or set
+`c.Password` in a `ConnectWith` tune.
+
+An integer timeout is a count of seconds, and one that is **`<= 0` keeps the default**:
+`queryOptions.duration` turns it into `-1`, a deadline that has already passed, and `Connect` puts
+pgdriver's default back — 5s to dial, 10s to read, 5s to write — as 0.5.0 did for
+`?connect_timeout=0`. Written as a duration, `?read_timeout=0s` parses to zero, which `parseDSN`
+skips, with the same result. No DSN spelling means "no timeout"; that takes a `ConnectWith` tune,
+and `Connect`'s doc comment says why not to.
 
 `postgres://`, `postgresql://` and `unix:///path/to/socket` all parse.
 
@@ -56,7 +62,7 @@ configure — **and nothing verified.**
 |---|---|---|
 | absent, `allow`, `prefer` | on | nothing — `InsecureSkipVerify: true`, `sslrootcert` or not |
 | `require` | on | nothing, unless `sslrootcert` is given too, when it acts as `verify-ca` |
-| `verify-ca` | on | the certificate chain only — **not the host name** |
+| `verify-ca` | on | chain and host name — as in 0.5.0; pgdriver alone checks the chain only |
 | `verify-full` | on | chain and host name |
 | `disable` | off | — |
 | anything else | — | `pgdriver: sslmode 'x' is not supported`, at parse |
@@ -64,13 +70,14 @@ configure — **and nothing verified.**
 Use `?sslmode=verify-full` in production. This is stated plainly because a library that ships
 `InsecureSkipVerify` silently is doing its users a disservice.
 
-**`verify-ca` is a real break from 0.5.0, and it does not fail loudly.** go-pg mapped `verify-ca`
-and `verify-full` to the same bare `&tls.Config{}`, which verifies the host name too, so a
-connection string that says `verify-ca` has been getting `verify-full` all along. pgdriver
-implements Postgres's own definition instead: `InsecureSkipVerify: true` plus a
-`VerifyPeerCertificate` that calls `x509.Certificate.Verify` with no `DNSName`. Any certificate
-your roots trust now passes, whatever host it names. If your DSN says `verify-ca`, change it to
-`verify-full`.
+**`verify-ca` checks the host name, as it did in 0.5.0.** go-pg mapped `verify-ca` and
+`verify-full` to the same bare `&tls.Config{}`, which verifies the host name too. pgdriver
+implements Postgres's own definition instead — `InsecureSkipVerify: true` plus a
+`VerifyPeerCertificate` that calls `x509.Certificate.Verify` with no `DNSName` — for `verify-ca`
+and for `require` with an `sslrootcert`. `Connect` clears both, so crypto/tls verifies the same
+roots and the host name, and a DSN carried over from 0.5.0 is not quietly weaker. A chain-only
+check, for a certificate that names a host other than the one you dial, is a `VerifyConnection` of
+your own in a `ConnectWith` tune.
 
 luima no longer fills `ServerName`, because pgdriver sets it — for `require`, `verify-ca` and
 `verify-full` alike — from the host in the URL's authority with its port stripped
@@ -99,9 +106,10 @@ fallback".
 
 Three fallbacks changed with the driver:
 
-- **`$PGPASSWORD` is not read.** go-pg fell back to it; pgdriver takes a password only from the
-  URL's user info or from a `ConnectWith` tune. A deployment that supplied the password through the
-  environment connects with no password at all — accepted by a `trust` server, refused at boot by a
+- **`$PGPASSWORD` is read by luima, not the driver.** pgdriver takes a password only from the URL's
+  user info; `Connect` fills an empty one from `$PGPASSWORD`, as go-pg did, before any `ConnectWith`
+  tune runs. go-pg fell back once more, to `postgres`; luima does not, so a deployment with neither
+  connects with no password — accepted by a `trust` server, refused at boot by a
   password-authenticated one.
 - **A DSN with no database name is silent.** `parseDSN` sets the database only when the URL has a
   path longer than `/`, so `postgres://u:p@host:5432` connects to `$PGDATABASE`, then `postgres`.

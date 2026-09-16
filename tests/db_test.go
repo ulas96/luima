@@ -232,34 +232,31 @@ func TestConnectVerifyFull(t *testing.T) {
 	}
 }
 
-// TestConnectVerifyCA @notice Asserts what the two verifying sslmodes check: verify-ca the
-// certificate chain and not the host name, verify-full the host name too.
+// TestConnectVerifyCA @notice Asserts what the verifying sslmodes check: the certificate chain
+// and the host name, under verify-ca and require-with-sslrootcert as under verify-full.
 //
 // @dev Needs no database. The stub answers the SSLRequest with 'S' and completes a real TLS
-// handshake, in the first two cases as a server whose certificate chains to the CA the DSN names in
-// sslrootcert but is valid only for 192.0.2.1, while the DSN dials 127.0.0.1. What is asserted is
-// whether the client let that handshake finish; the stub hangs up afterwards, so Connect fails
+// handshake, in the first three cases as a server whose certificate chains to the CA the DSN names
+// in sslrootcert but is valid only for 192.0.2.1, while the DSN dials 127.0.0.1. What is asserted
+// is whether the client let that handshake finish; the stub hangs up afterwards, so Connect fails
 // either way.
 //
-// verify-full has to refuse it, with an x509.HostnameError: pgdriver leaves the check to
-// crypto/tls with ServerName set from the host (parseDSN). The error type is asserted, not just
-// the failure, because a verify-full that fails for any other reason fails the stub's handshake
-// too — a ServerName that never got set is refused by crypto/tls before it sends a ClientHello —
-// and would pass a test that only wanted a failure. A Connect that verified verify-full as
-// verify-ca would accept a certificate its CA signed for any host, and nothing else in this suite
-// would notice.
+// All three have to refuse it, with an x509.HostnameError. The error type is asserted, not just
+// the failure, because a mode that fails for any other reason fails the stub's handshake too — a
+// ServerName that never got set is refused by crypto/tls before it sends a ClientHello — and would
+// pass a test that only wanted a failure.
 //
-// verify-ca has to accept it, and that half pins a change rather than a guarantee. pgdriver checks
-// verify-ca's chain in a VerifyPeerCertificate callback, with InsecureSkipVerify set and no host
-// name (parseDSN) — libpq's meaning of verify-ca. 0.5.0 checked the host name under verify-ca as
-// well. When this half fails, pgdriver has started checking it again, and db.Connect's TLS bullet
-// is out of date.
+// verify-ca and require-with-sslrootcert are the two that pin luima rather than pgdriver. pgdriver
+// checks their chain in a VerifyPeerCertificate callback, with InsecureSkipVerify set and no host
+// name (parseDSN) — libpq's meaning of verify-ca — and 0.5.0 checked the host name under verify-ca.
+// connector hands both back to crypto/tls's full check. Without it, any certificate the CA signed
+// for any host passes, and a verify-ca DSN carried over from 0.5.0 is silently weaker.
 //
-// Accepting one certificate is not the same claim as checking the chain, so the third case is the
+// Refusing one certificate is not the same claim as checking the chain, so the last case is the
 // one that pins the chain: a leaf valid for the address being dialed, signed by a second CA that
 // sslrootcert does not name. verify-ca has to refuse that, with an x509.UnknownAuthorityError.
 // Without it, a verify-ca that dropped the callback and kept InsecureSkipVerify — accepting any
-// certificate at all, which is what "require" does — would pass both other cases.
+// certificate at all, which is what plain "require" does — would pass as long as it checked names.
 //
 // @param t the test handle
 func TestConnectVerifyCA(t *testing.T) {
@@ -276,11 +273,11 @@ func TestConnectVerifyCA(t *testing.T) {
 		name                 string
 		mode                 string
 		leaf                 tls.Certificate
-		accepted             bool
 		wantHostname         bool
 		wantUnknownAuthority bool
 	}{
-		{name: "verify-ca", mode: "verify-ca", leaf: leaf, accepted: true},
+		{name: "verify-ca", mode: "verify-ca", leaf: leaf, wantHostname: true},
+		{name: "require with sslrootcert", mode: "require", leaf: leaf, wantHostname: true},
 		{name: "verify-full", mode: "verify-full", leaf: leaf, wantHostname: true},
 		{name: "verify-ca untrusted chain", mode: "verify-ca", leaf: untrusted, wantUnknownAuthority: true},
 	} {
@@ -321,10 +318,7 @@ func TestConnectVerifyCA(t *testing.T) {
 
 			select {
 			case err := <-handshake:
-				if tc.accepted && err != nil {
-					t.Errorf("%s refused a certificate its CA signed for another host: the stub's handshake = %v, Connect = %v", tc.name, err, connErr)
-				}
-				if !tc.accepted && err == nil {
+				if err == nil {
 					t.Errorf("%s completed a handshake it had to refuse (Connect = %v)", tc.name, connErr)
 				}
 			case <-time.After(10 * time.Second):
@@ -332,7 +326,7 @@ func TestConnectVerifyCA(t *testing.T) {
 			}
 
 			if _, ok := errors.AsType[x509.HostnameError](connErr); ok != tc.wantHostname {
-				t.Errorf("Connect = %v — want an x509.HostnameError only from verify-full", connErr)
+				t.Errorf("Connect = %v — want an x509.HostnameError from every mode handed a certificate for another host", connErr)
 			}
 			if _, ok := errors.AsType[x509.UnknownAuthorityError](connErr); ok != tc.wantUnknownAuthority {
 				t.Errorf("Connect = %v — want an x509.UnknownAuthorityError only from the untrusted chain", connErr)
@@ -521,6 +515,89 @@ func TestConnectKeepsSocketTimeouts(t *testing.T) {
 	}
 	if got := live.ConnParams["statement_timeout"]; got != any(int64(1500)) {
 		t.Errorf("the config tune changed ends with statement_timeout = %#v, want tune's int64(1500) — nothing may apply the DSN over it", got)
+	}
+}
+
+// TestConnectDSNParity @notice Pins the three places connector reads a DSN the way 0.5.0 and
+// libpq did rather than the way pgdriver does.
+//
+// @dev Needs no database. tune sees the config after connector has finished with it, so it reads
+// what every connection would dial with, and its Dialer refuses the dial, so nothing leaves the
+// process.
+//
+//   - An integer timeout <= 0. pgdriver's queryOptions.duration turns it into -1ns, a deadline that
+//     has already passed, so ?connect_timeout=0 — libpq's "no timeout" — failed every dial and
+//     ?read_timeout=0 every read. It has to come back as pgdriver's default.
+//   - $PGPASSWORD. go-pg read it for a DSN with no password; pgdriver does not read it at all, so a
+//     deployment that keeps the password in the environment connects with none. A password in the
+//     DSN still wins.
+//   - ?password= and ?sslpassword=. pgdriver does not read either, so both became SET name TO
+//     'value' on every connection, which Postgres refuses with 42704 and, at the default
+//     log_min_error_statement, writes to the server log with the value in it. They have to be
+//     refused before tune runs — which is before anything dials — and without the value in the
+//     error.
+//
+// @param t the test handle
+func TestConnectDSNParity(t *testing.T) {
+	refuse := func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("tune's dialer refuses every dial")
+	}
+	connect := func(t *testing.T, url string) (pgdriver.Config, bool, error) {
+		t.Helper()
+		var (
+			seen   pgdriver.Config
+			called bool
+		)
+		_, err := db.ConnectWith(url, func(c *pgdriver.Config) {
+			seen, called = *c, true
+			c.Dialer = refuse
+		})
+		if err == nil {
+			t.Fatal("ConnectWith returned no error with a Dialer that refuses every dial")
+		}
+		return seen, called, err
+	}
+
+	t.Run("an integer timeout <= 0 is pgdriver's default", func(t *testing.T) {
+		seen, _, _ := connect(t, "postgres://u:p@127.0.0.1/d?sslmode=disable&connect_timeout=0&read_timeout=0&write_timeout=-5")
+		if seen.DialTimeout != 5*time.Second || seen.ReadTimeout != 10*time.Second || seen.WriteTimeout != 5*time.Second {
+			t.Errorf("DialTimeout %v, ReadTimeout %v, WriteTimeout %v — want pgdriver's 5s, 10s and 5s, not a deadline already passed",
+				seen.DialTimeout, seen.ReadTimeout, seen.WriteTimeout)
+		}
+	})
+
+	t.Run("?timeout=0 is pgdriver's default for all three", func(t *testing.T) {
+		seen, _, _ := connect(t, "postgres://u:p@127.0.0.1/d?sslmode=disable&timeout=0")
+		if seen.DialTimeout != 5*time.Second || seen.ReadTimeout != 10*time.Second || seen.WriteTimeout != 5*time.Second {
+			t.Errorf("DialTimeout %v, ReadTimeout %v, WriteTimeout %v — want pgdriver's 5s, 10s and 5s",
+				seen.DialTimeout, seen.ReadTimeout, seen.WriteTimeout)
+		}
+	})
+
+	t.Run("$PGPASSWORD fills a DSN with no password", func(t *testing.T) {
+		t.Setenv("PGPASSWORD", "from-env")
+		if seen, _, _ := connect(t, "postgres://u@127.0.0.1/d?sslmode=disable"); seen.Password != "from-env" {
+			t.Errorf("Password = %q, want $PGPASSWORD's %q", seen.Password, "from-env")
+		}
+		if seen, _, _ := connect(t, "postgres://u:from-dsn@127.0.0.1/d?sslmode=disable"); seen.Password != "from-dsn" {
+			t.Errorf("Password = %q, want the DSN's %q — the DSN has to win over the environment", seen.Password, "from-dsn")
+		}
+	})
+
+	for _, param := range []string{"password", "PASSWORD", "sslpassword"} {
+		t.Run("?"+param+"= is refused", func(t *testing.T) {
+			const secret = "s3cret-in-query"
+			_, called, err := connect(t, "postgres://u@127.0.0.1/d?sslmode=disable&"+param+"="+secret)
+			if called {
+				t.Errorf("tune ran, so the DSN was accepted (ConnectWith = %v) — ?%s= must be refused while parsing", err, param)
+			}
+			if !strings.HasPrefix(err.Error(), "parse database url:") {
+				t.Errorf("ConnectWith = %v, want a parse error", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("ConnectWith = %v carries the value", err)
+			}
+		})
 	}
 }
 

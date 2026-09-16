@@ -274,11 +274,19 @@ starts from; an `sslrootcert` on its own does enter it — the switch is guarded
 and lands in the empty case beside `allow` and `prefer`, which sets `InsecureSkipVerify` itself and
 then loads roots nothing checks. Use `?sslmode=verify-full`.
 
-**`?sslmode=verify-ca` verifies less than it did.** go-pg mapped `verify-ca` and `verify-full` to
-one bare `&tls.Config{}`, which checks the host name too. pgdriver implements Postgres's own
-definition — `InsecureSkipVerify: true` plus a `VerifyPeerCertificate` that calls
-`x509.Certificate.Verify` with no `DNSName` — so any certificate your roots trust now passes,
-whatever host it names. A DSN that says `verify-ca` should say `verify-full`.
+**`?sslmode=verify-ca` checks the host name, as it did in 0.5.0.** pgdriver implements Postgres's
+own definition — `InsecureSkipVerify: true` plus a `VerifyPeerCertificate` that calls
+`x509.Certificate.Verify` with no `DNSName` — for `verify-ca`, and for `require` with an
+`sslrootcert`. On its own that lets any certificate your roots trust pass, whatever host it names.
+`db.Connect` clears both fields and hands the connection back to crypto/tls, which verifies the same
+roots and the host name, so neither mode is weaker than `verify-full`. A chain-only check, when you
+want one, is a `VerifyConnection` of your own in a `ConnectWith` tune.
+
+**`?password=` and `?sslpassword=` are refused.** pgdriver reads neither, so each would go to the
+server as `SET password TO '…'` once authentication had succeeded without it — trust, peer, a client
+certificate, or the same password in the user info. Postgres rejects that statement and, at the
+default `log_min_error_statement`, writes it to the server log, value included, where no redaction
+of luima's reaches. `Connect` refuses both names, in any letter case, before anything dials.
 
 luima no longer fills `ServerName`, because pgdriver sets it from the URL's authority for `require`,
 `verify-ca` and `verify-full` alike. One shape still reaches crypto/tls's refusal to handshake with
