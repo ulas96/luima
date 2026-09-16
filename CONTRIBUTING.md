@@ -11,7 +11,8 @@ cd luima
 go build ./...
 ```
 
-You need Go ≥ 1.25 and, for the tests that matter, a Postgres you can throw away.
+You need Go ≥ 1.27 — both modules declare it — and, for the tests that matter, a Postgres you can
+throw away.
 
 ```sh
 cp .env.example .env    # or write it yourself
@@ -30,20 +31,22 @@ make test-db    # sources .env. TestCRUD runs.
 
 > ### A green `go test ./...` proves less than it looks
 >
-> `TestCRUD` calls `t.Skip` without `DATABASE_URL`, and **a skipped test still reports `ok`**.
-> It is also the only test that exercises the driver behaviours the library exists to handle. Run
-> `make test-db`, read the `-v` output, and confirm you see `--- PASS: TestCRUD` rather than
-> `--- SKIP`.
+> Four tests call `t.Skip` without `DATABASE_URL`, and **a skipped test still reports `ok`**:
+> `TestCRUD`, `TestStatementTimeout`, `TestStatementTimeoutNegativeDisables` and
+> `TestConnectPoolBound`. They are the ones that reach a server, which is the only place a `SET`
+> that never arrives, a bound Postgres does not enforce, or a pool left at `database/sql`'s own
+> sizing can be told apart from the thing that works. Run `make test-db`, read the `-v` output, and
+> confirm you see `--- PASS: TestCRUD` rather than `--- SKIP`.
 >
-> CI runs it against a `postgres:16` service container and fails the build if it skips, so this
-> cannot rot — but it can still waste your afternoon locally.
+> CI runs them against a `postgres:16` service container and fails the build if `TestCRUD` skips,
+> so this cannot rot — but it can still waste your afternoon locally.
 
 `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL` is the only setup.
 
 ## Before you open a PR
 
 ```sh
-make check    # gofmt + vet + lint + test-db + example
+make check    # gofmt + vet + lint + audit + test-db + example + luimagen-roundtrip
 ```
 
 ## Where code goes
@@ -104,10 +107,14 @@ leftovers; that grep is the check. See [docs/gqlgen-contract.md](docs/gqlgen-con
 ## Style
 
 - **Comments explain why, not what.** Most of this library's value is in the comments that say
-  what breaks if a line is removed — `All` not `Post`, the two absence signals, `RETURNING *`.
-  If you move code, the comment moves with it.
-- **A change to behaviour needs a test that fails without it.** The `Update`/`pg.ErrNoRows`
-  interaction was found by running the round trip against a real Postgres, not by reading docs.
+  what breaks if a line is removed — `All` not `Post`, `Exec` not `Scan` in `Create` and `Update`,
+  `RETURNING *`. If you move code, the comment moves with it.
+- **A change to behaviour needs a test that fails without it**, and against a real Postgres
+  wherever that is the only place it shows. `Create` and `Update` have one absence signal —
+  `RowsAffected() == 0`, with no error — and both spellings compile and read as correct: `Exec`
+  reports that zero, `Scan` would report `sql.ErrNoRows` instead, and nothing but a row that is not
+  there tells them apart. `testSwallowedByTrigger` is the shape to copy: a `BEFORE INSERT`
+  trigger returning `NULL`, and a `Create` that has to answer `(nil, nil)`.
 - **New public API needs a godoc example.** They render on pkg.go.dev and compile with the test
   suite, so they cannot go stale.
 - Update `CHANGELOG.md` under `## [Unreleased]`.

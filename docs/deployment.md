@@ -2,62 +2,131 @@
 
 [← back to the README](../README.md)
 
-`pg.ParseURL` and Docker behaviours, then serving over TLS. All are surprising; the Postgres ones
-are mostly startup failures rather than warnings, the serving ones mostly fail silently.
+pgdriver's DSN parsing and Docker behaviours, then serving over TLS. All are surprising; the
+Postgres ones now fail at the boot round trip rather than at parse — and some of them do not fail at
+all — while the serving ones mostly fail silently.
 
 ---
 
 ## Connection URLs
 
-### `pg.ParseURL` accepts exactly three query parameters
+### An unknown query parameter becomes a `SET`, not a parse error
 
-`sslmode`, `application_name`, `connect_timeout`. Anything else is a hard error:
+pgdriver's `parseDSN` reads eleven parameters — `host`, `sslmode`, `sslrootcert`, `sslcert`,
+`sslkey`, `application_name`, `timeout`, `dial_timeout`, `connect_timeout`, `read_timeout` and
+`write_timeout`. Everything left over becomes a `Config.ConnParams` entry, and `newConn` sends one
+`SET <name> TO <value>` per entry on every connection it opens, before that connection is used.
 
-```
-pg: options other than 'sslmode', 'application_name' and 'connect_timeout' are not supported
-```
+So `?statement_timeout=5s` works now, where go-pg's URL parser refused every parameter but three —
+`sslmode`, `application_name` and `connect_timeout`. What that refusal bought was a parse-time
+error, and this is what replaces it:
 
-So pgx-style URL tuning — `?default_query_exec_mode=simple_protocol`, `?pool_max_conns=10` — is a
-**startup failure**, not a no-op. If you are migrating from pgx, strip the extras.
+| DSN parameter | what happens |
+|---|---|
+| `?statement_timeout=5s` | `SET statement_timeout TO '5s'` on every new connection |
+| `?statement_timout=5s` (typo) | the boot round trip fails, SQLSTATE **42704**, `unrecognized configuration parameter` |
+| `?pool_max_conns=10` (pgx-style) | the same 42704 — strip the extras, as before |
+| `?app.tenant=acme` | **accepted silently**; Postgres takes a dotted name as a custom setting |
+| `?a-b=1` | the boot round trip fails, SQLSTATE **42601** — Postgres cannot read the key as an identifier |
 
-Both `postgres://` and `postgresql://` schemes parse.
+The failures are `Connect`'s, at startup, wrapped as `ping: …` — which is the reason `Connect` does
+a round trip at all. The dotted name has nothing to fail: if you rely on one, read it back from
+`pg_settings`.
+
+`sslcert` and `sslkey` are read only alongside `sslmode` or `sslrootcert`, because `parseDSN` looks
+at them inside that branch. Given on their own they are left over like any other parameter, go out
+as `SET`s, and fail 42704.
+
+An integer timeout is a count of seconds, and one that is **`<= 0` is not "no timeout"**:
+`queryOptions.duration` turns it into `-1`, so `?connect_timeout=0` fails every dial at once and
+`?read_timeout=0` every read. Written as a duration, `?read_timeout=0s` parses to zero, which
+`parseDSN` skips — leaving pgdriver's default in place. Two spellings of one intent that do
+opposite things.
+
+`postgres://`, `postgresql://` and `unix:///path/to/socket` all parse.
 
 ### With `sslmode` absent, TLS is on but the certificate is not verified
 
-`ParseURL` returns `&tls.Config{InsecureSkipVerify: true}` when `sslmode` is not in the URL. A
-managed Postgres therefore connects over TLS with nothing to configure — **and nothing verified.**
+`newDefaultConfig` starts every connection at `&tls.Config{InsecureSkipVerify: true}`, and
+`parseDSN` enters its `sslmode` switch only when `sslmode` or `sslrootcert` is in the URL. A URL
+with neither therefore keeps that default: a managed Postgres connects over TLS with nothing to
+configure — **and nothing verified.**
 
-| `sslmode` | result |
-|---|---|
-| absent | TLS on, `InsecureSkipVerify: true` |
-| `verify-ca`, `verify-full` | TLS on, certificate verified |
-| `allow`, `prefer`, `require` | TLS on, `InsecureSkipVerify: true` |
-| `disable` | no TLS |
-| anything else | `pg: sslmode 'x' is not supported` |
+| `sslmode` | TLS | verified |
+|---|---|---|
+| absent, `allow`, `prefer` | on | nothing — `InsecureSkipVerify: true`, `sslrootcert` or not |
+| `require` | on | nothing, unless `sslrootcert` is given too, when it acts as `verify-ca` |
+| `verify-ca` | on | the certificate chain only — **not the host name** |
+| `verify-full` | on | chain and host name |
+| `disable` | off | — |
+| anything else | — | `pgdriver: sslmode 'x' is not supported`, at parse |
 
 Use `?sslmode=verify-full` in production. This is stated plainly because a library that ships
 `InsecureSkipVerify` silently is doing its users a disservice.
 
-The verified rows in that table are only true because `db.Connect` fixes up the `tls.Config`.
-`pg.ParseURL` maps `verify-ca` and `verify-full` to a bare `&tls.Config{}` and never sets
-`ServerName`, and the driver plumbs no host into its `tls.Client` call either — so crypto/tls
-refuses the handshake outright with *"either ServerName or InsecureSkipVerify must be specified"*.
-Before 0.2.0 `verify-full` therefore could not connect at all, and the natural workaround was
-`?sslmode=require`, which is `InsecureSkipVerify: true`. `Connect` now fills `ServerName` in from
-the address. Two smaller notes on the same code path: go-pg treats `verify-ca` and `verify-full` as
-identical and both verify the hostname, which is stricter than Postgres's own definition of
-`verify-ca`; and `?connect_timeout=N` bounds the whole boot round trip here, not just the dial.
+**`verify-ca` is a real break from 0.5.0, and it does not fail loudly.** go-pg mapped `verify-ca`
+and `verify-full` to the same bare `&tls.Config{}`, which verifies the host name too, so a
+connection string that says `verify-ca` has been getting `verify-full` all along. pgdriver
+implements Postgres's own definition instead: `InsecureSkipVerify: true` plus a
+`VerifyPeerCertificate` that calls `x509.Certificate.Verify` with no `DNSName`. Any certificate
+your roots trust now passes, whatever host it names. If your DSN says `verify-ca`, change it to
+`verify-full`.
+
+luima no longer fills `ServerName`, because pgdriver sets it — for `require`, `verify-ca` and
+`verify-full` alike — from the host in the URL's authority with its port stripped
+(`net.SplitHostPort`). That retires the 0.2.0 fix: before it, `verify-full` could not connect at
+all, crypto/tls refused the handshake with *"either ServerName or InsecureSkipVerify must be
+specified"*, and the natural workaround was `?sslmode=require`, which is `InsecureSkipVerify: true`.
+One shape still reaches that refusal: a host named only with `?host=`, which leaves the URL's
+authority — and so `ServerName` — empty. Set `c.TLSConfig.ServerName` in a `ConnectWith` tune for
+that one.
+
+No mode but `disable` falls back to plaintext. `allow` and `prefer` are TLS here, and a server that
+answers the SSL request with anything but `S` is `pgdriver: SSL is not enabled on the server`
+(`enableSSL`) — so a Postgres without TLS, a CI container or a unix socket, needs
+`?sslmode=disable`. And `?connect_timeout=N` bounds the whole boot round trip, not just the dial:
+`ConnectWith` gives its `select 1` a context deadline of `DialTimeout`, which is what
+`connect_timeout` sets.
 
 ### A DSN that lost its credentials still connects
 
-`ParseURL` defaults the user to `postgres`, and go-pg then falls back to `$PGUSER`, `$PGPASSWORD`
-and finally the literal `postgres`. A connection string mangled by a bad interpolation does not
-fail as a configuration error — it attempts `postgres/postgres`, and on a permissive local or CI
-database it *succeeds*. The `select 1` in `Connect` cannot tell "connected as the intended role"
-from "connected as the fallback".
+`newDefaultConfig` fills the config from the environment before the DSN is applied at all:
+`$PGHOST`, `$PGPORT`, `$PGUSER` and `$PGDATABASE`, falling back to `localhost`, `5432`, `postgres`
+and `postgres`. A connection string mangled by a bad interpolation does not fail as a configuration
+error — it attempts `postgres/postgres`, and on a permissive local or CI database it *succeeds*. The
+`select 1` in `Connect` cannot tell "connected as the intended role" from "connected as the
+fallback".
 
-Set `?application_name=your-service` — one of the three parameters `ParseURL` accepts — so
-`pg_stat_activity` shows which service, and which role, actually connected.
+Three fallbacks changed with the driver:
+
+- **`$PGPASSWORD` is not read.** go-pg fell back to it; pgdriver takes a password only from the
+  URL's user info or from a `ConnectWith` tune. A deployment that supplied the password through the
+  environment connects with no password at all — accepted by a `trust` server, refused at boot by a
+  password-authenticated one.
+- **A DSN with no database name is silent.** `parseDSN` sets the database only when the URL has a
+  path longer than `/`, so `postgres://u:p@host:5432` connects to `$PGDATABASE`, then `postgres`.
+  Under go-pg luima raised that as a parse error. Now it is a working connection to the wrong
+  database.
+- **`$PGPORT` applies only when the DSN names no host.** With a host, `parseDSN` uses it and appends
+  `:5432` when it contains no colon — so an IPv6 literal, which is all colons, gets no port at all:
+  `postgres://u:p@[::1]/db` fails to dial with `missing port in address` until it is written
+  `[::1]:5432`. `?host=` is dialed as written, with no port added either.
+
+**Percent-encode `/`, `?`, `#` and `%` in a user or a password.** An unescaped one ends the URL's
+authority early, and what happens next depends on what is left. `url.Parse` rejects
+`postgres://app:Xk9/Q@db/app` outright, for the non-numeric port `:Xk9` — the password's first part,
+quoted in the error. It accepts `postgres://127.0.0.1:2024#x@db/app`, where the user becomes the
+host and `2024`, the start of the password, becomes the port, for pgdriver to dial and name in
+`dial tcp 127.0.0.1:2024: connect: connection refused`; and `postgres://app:p@ss/x@db/app`, which
+dials the host `ss`. `Connect` refuses the shapes that parse before anything dials: what they have
+in common, and a well-formed DSN almost never has, is the `@` that should have ended the user info
+sitting outside the authority — in the path, query or fragment — and a DSN that means it can write
+that one `%40`. The shape `url.Parse` itself rejects comes back with every quoted fragment
+replaced and the same advice appended. No error `Connect` returns quotes the DSN or the password;
+in 0.5.0 the parse error carried the password's first part.
+
+Set `?application_name=your-service` so `pg_stat_activity` shows which service, and which role,
+actually connected.
 
 ### Supabase: use the session pooler on port 5432
 
@@ -97,9 +166,11 @@ luima's own Makefile does this; copy the `ENV` variable from it.
 
 ## Connecting
 
-`Connect` issues an eager `select 1`, because `pg.Connect` is lazy and dials nothing. Without that
-round trip a bad credential surfaces one failed request at a time in production instead of once,
-loudly, at boot.
+`Connect` returns a `*bun.DB` and issues an eager `select 1` on it, because `sql.OpenDB` and
+`bun.NewDB` dial nothing — pgdialect's `Init` is empty. Without that round trip a bad credential
+surfaces one failed request at a time in production instead of once, loudly, at boot; and now that
+an unrecognized DSN parameter is a `SET` rather than a parse error, the round trip is also where a
+typo in one is caught.
 
 It returns its error rather than calling `log.Fatal`, and takes the URL rather than reading
 `os.Getenv` itself. A library must not kill your process, choose your logging, or read
@@ -112,6 +183,14 @@ if err != nil {
 }
 defer db.Close()
 ```
+
+`Connect` also sizes the pool, because `database/sql`'s defaults are wrong for a server: unlimited
+open connections turn a burst of requests into a burst of connections and then into Postgres's
+`53300 too_many_connections`, and two idle connections mean every burst past two concurrent queries
+re-dials, re-handshakes and re-`SET`s the extras it just closed. It sets ten per CPU open and idle
+with a 5 minute idle time — the pool 0.5.0 ran with, which was go-pg's own default sizing. Resize it
+on the handle if that is wrong for you: `*bun.DB` embeds `*sql.DB` through its state struct, so
+`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxIdleTime` and `Stats` are all promoted onto it.
 
 ---
 
@@ -235,7 +314,9 @@ too, and `HTTPMiddleware` does not wrap it — the rate limiter cannot 429 the p
 healthy-but-busy process out of rotation. `HealthCheck` receives a context with a 2s deadline and
 runs on its own goroutine, so a wedged database answers 503 rather than hanging: a probe that hangs
 reads to a load balancer as a slow server rather than a broken one, and slow servers are left in.
-`db.Ping` already has the signature.
+`db.PingContext` already has the signature — `*bun.DB` embeds `*sql.DB` through its state struct.
+Not `db.Ping`, which takes no context, does not compile in the field, and would have run the probe
+on `context.Background()` and ignored that 2s deadline.
 
 **Draining.** `luima.Run` returns its error instead of exiting, which is what lets a
 `defer db.Close()` above it run — `log.Fatal` calls `os.Exit` and skips every deferred function.

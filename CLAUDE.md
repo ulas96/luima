@@ -16,18 +16,23 @@ make luimagen-roundtrip  # scaffold a type into a scratch copy of the example �
 
 Single test: `go test -v -count=1 -run TestCRUD ./tests/` (with `DATABASE_URL` set for that one).
 
-**A green `go test ./...` proves less than it looks.** `TestCRUD` is the only test that touches a
-real driver, and it `t.Skip`s without `DATABASE_URL` — a skip still reports `ok`. Confirm
-`--- PASS: TestCRUD`, not `--- SKIP`. CI pins this with a `postgres:16` service container and greps
-the `-v` output. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL`
-(copy `.env.example` → `.env`, unquoted) is the whole setup.
+**A green `go test ./...` proves less than it looks.** Four tests `t.Skip` without `DATABASE_URL`,
+and a skip still reports `ok`: `TestCRUD`, `TestStatementTimeout`,
+`TestStatementTimeoutNegativeDisables` and `TestConnectPoolBound`. They are the only ones that reach
+a server, which is where a `SET` that never arrives, a bound Postgres does not enforce and a pool
+left at `database/sql`'s sizing all look exactly like the working thing. Confirm
+`--- PASS: TestCRUD`, not `--- SKIP`. CI pins that one with a `postgres:16` service container and
+greps the `-v` output; the other three run in the same `DATABASE_URL`-set step but are not grepped
+for. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL` (copy
+`.env.example` → `.env`, unquoted) is the whole setup.
 
 ## Architecture
 
-luima is the boilerplate between gqlgen and Fiber v3, over go-pg. It **cannot** replace gqlgen
-codegen — `generated.NewExecutableSchema` is a symbol only the consumer's own `go tool gqlgen
-generate` produces. Consumers still own `gqlgen.yml`, `schema.graphqls`, `graph/resolver.go`.
-`docs/gqlgen-contract.md` is that contract; `docs/gotchas.md` is the failure catalogue.
+luima is the boilerplate between gqlgen and Fiber v3, over bun with `pgdialect` and `pgdriver`. It
+**cannot** replace gqlgen codegen — `generated.NewExecutableSchema` is a symbol only the consumer's
+own `go tool gqlgen generate` produces. Consumers still own `gqlgen.yml`, `schema.graphqls`,
+`graph/resolver.go`. `docs/gqlgen-contract.md` is that contract; `docs/gotchas.md` is the failure
+catalogue.
 
 | package | what belongs there |
 |---|---|
@@ -55,8 +60,11 @@ directory), but they still compile and their `Output` blocks still run.
 `luimagen/internal_test.go` is the one exception, and `package luimagen`. The rule buys a
 consumer's-eye view of an API, and `Generate` has almost none — one call that shells out to gqlgen
 and rewrites files. Everything worth pinning is in the unexported steps between: `snakeCase`'s
-go-pg boundary, `lowerFirst`, the declare-vs-extend probe, `patchSource`'s splice and its import
-fix. `tests/luimagen_test.go` still covers the exported surface from outside. `docs/luimagen.md` §5.
+column boundary (bun's `Underscore` is byte-identical to the go-pg one it was written against —
+both `internal/underscore.go`, agreeing line for line through the function — so no derived column
+name moved in the port), `checkTag`'s two rejections, `lowerFirst`, the declare-vs-extend probe,
+`patchSource`'s splice and its import fix. `tests/luimagen_test.go` still covers the exported
+surface from outside. `docs/luimagen.md` §5.
 
 ### The two load-bearing invariants
 
@@ -126,8 +134,8 @@ question to answer first is which `Config` field or free function is missing.
   and `luimagen/patch.go` are exempt — they are one internal pipeline, and their reasoning is
   carried as prose here and in `docs/luimagen.md` §2 rather than split across thirty tag blocks.
   `luimagen/luimagen.go` and `cmd/luimagen/main.go` are not exempt: they are the exported surface.
-- Comments explain what breaks if the line is removed (`All` not `Post`, the two absence signals in
-  `Update`, `RETURNING *`). If code moves, the comment moves with it.
+- Comments explain what breaks if the line is removed (`All` not `Post`, `Exec` not `Scan` in
+  `Create` and `Update`, `RETURNING *`). If code moves, the comment moves with it.
 - A behaviour change needs a test that fails without it; new public API needs a godoc example in
   `tests/`; update `CHANGELOG.md` under `## [Unreleased]`.
 

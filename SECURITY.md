@@ -52,14 +52,24 @@ does.
 every request, so a per-request field on it is a cross-request data race — which under concurrency
 is an authorization bypass, not a bug you find in testing.
 
-Then scope the query. Every CRUD helper except `Create` takes query modifiers, which is where the
-ownership predicate goes:
+Then scope the query. Every CRUD helper takes query modifiers, and that is where the ownership
+predicate goes — on `Get`, `List`, `Update` and `Delete`, the four that match a row that already
+exists:
 
 ```go
-luima.Delete(ctx, r.DB, &model.User{PersonalID: id}, func(q *orm.Query) *orm.Query {
+luima.Delete(ctx, r.DB, &model.User{PersonalID: id}, func(q *bun.DeleteQuery) *bun.DeleteQuery {
     return q.Where("owner_id = ?", callerID(ctx))
 })
 ```
+
+The closure type is bun's statement type, so it differs per helper: `*bun.SelectQuery` for `Get` and
+`List`, `*bun.UpdateQuery` for `Update`, `*bun.DeleteQuery` for `Delete`, `*bun.InsertQuery` for
+`Create`. One ownership predicate therefore faces three statement types, and copying it into each is
+how two paths end up scoped and the third does not. Write it once instead, as a
+`func(bun.QueryBuilder) bun.QueryBuilder` — that interface is the WHERE clause and nothing else —
+and apply it with `q.ApplyQueryBuilder(owned)`, which the select, update and delete queries all
+have. `*bun.InsertQuery` does not, and needs none: there is no stored row to own yet. Nothing in the
+compiler reports the helper you forgot.
 
 A row that exists but is not the caller's then reports as absent, which is the right answer to
 give an unauthorized caller — it discloses no existence.
@@ -70,10 +80,11 @@ transaction.
 ## What luima does do
 
 **The error presenter redacts.** gqlgen's default presenter forwards `err.Error()` verbatim, which
-would hand an unauthenticated caller raw driver strings — `SQLSTATE 23505` and with it your table,
-column and constraint names. `luimaerr.PresentError` passes through only errors a resolver has
-explicitly marked safe (`*CustomError`) and gqlgen's own text about the query the client just
-sent; everything else is logged server-side and returned as `internal server error`.
+would hand an unauthenticated caller raw driver strings — pgdriver renders one as
+`ERROR: duplicate key value violates unique constraint "users_email_key" (SQLSTATE=23505)`, and
+with it your table, column and constraint names. `luimaerr.PresentError` passes through only errors
+a resolver has explicitly marked safe (`*CustomError`) and gqlgen's own text about the query the
+client just sent; everything else is logged server-side and returned as `internal server error`.
 
 It recognises gqlgen's text as a `*gqlerror.Error` that wraps no other error and was reported
 outside field resolution, and it needs both halves. gqlgen hands a resolver's plain error to the
@@ -86,11 +97,13 @@ This is damage control on information disclosure, not access control. Do not mis
 
 Three limits worth stating plainly:
 
-- **It redacts on the wire, not in the log.** The redacted error is written to stdout in full, and
-  a Postgres error's DETAIL field carries the offending row's values —
-  `Key (email)=(victim@example.com) already exists`. Your log store therefore inherits the
-  database's confidentiality requirements. Wrap `PresentError` with a `Config.ErrorPresenter` if
-  you need to filter or route that.
+- **It redacts on the wire, not in the log.** The redacted error is written to stderr in full —
+  your table, column and constraint names, and whatever of the client's own input Postgres quoted
+  back into the message. Not the row's values: `(pgdriver.Error).Error` renders the severity, the
+  message and the SQLSTATE and stops, so the DETAIL field that carries them
+  (`Key (email)=(victim@example.com) already exists`) is reachable with `Field('D')` and is nowhere
+  in that line. Your log store therefore inherits your schema, if not your rows. Wrap
+  `PresentError` with a `Config.ErrorPresenter` if you need to filter or route that.
 - **`CustomError.UserMessage` is returned verbatim.** Never build it from another error —
   `&CustomError{UserMessage: err.Error()}` undoes the redaction in one line that reads like
   careful error handling. Treat it as untrusted too: the usual way to build it is from client
@@ -119,26 +132,61 @@ luima.Config{
 Even with both, hiding the schema does not protect the data behind it. Treat it as raising the cost
 of reconnaissance, never as access control.
 
-**Requests are bounded.** `Config.RequestTimeout` defaults to 15s and puts a deadline on the
-resolver's context. That is the only bound a query gets — go-pg sets no read or write timeout by
-default, and `pg.ParseURL` rejects `statement_timeout` in the connection string — so it is doing
-real work: go-pg turns a context deadline into the socket deadline, bounds the connection-pool
-wait with it, and turns cancellation into a Postgres `CancelRequest` against the running backend.
-Without it, an unauthenticated caller can fire expensive queries and disconnect, and the server
-completes every one of them.
+**Requests are bounded on this side of the socket only.** `Config.RequestTimeout` defaults to 15s
+and puts a deadline on the resolver's context, which the database layer stops waiting on in three
+places: `database/sql` has no pool timeout of its own, so a request queued for a pooled connection
+gives up only when its context is done (`(*sql.DB).conn` selects on `ctx.Done()`); pgdriver makes
+that deadline the socket deadline for writing the query and reading the reply
+(`(*pgdriver.Conn).deadline`) — all of it for an `Exec`, and up to the row description for a query;
+and for the rows after that, which pgdriver reads on `context.TODO()`, `database/sql` watches the
+context itself and closes the `Rows` when it fires (`(*sql.Rows).awaitDone`). Without it, a caller
+can fire expensive queries and disconnect while each one holds a pooled connection, with the queue
+behind it unbounded.
 
-`CancelRequest` is best-effort — it dials a second connection and only logs a failure, so a query
-can outlive its own cancellation while holding a pooled connection every other request is queued
-behind. For a bound Postgres enforces itself whether or not the client is still there:
+**It does not stop the query.** pgdriver never sends a Postgres `CancelRequest`: it reads the
+backend's process id and cancel key during startup (`proto.go`, the `BackendKeyData` message) and
+never uses them again. A statement whose client has timed out runs on until it finishes, holding a
+backend and its locks, with nobody left to read the answer — so one caller, one expensive query, and
+a deadline bounds only what the server is willing to wait for. The bound Postgres enforces itself:
 
 ```go
-db, err := luima.ConnectWith(os.Getenv("DATABASE_URL"), luima.StatementTimeout(10*time.Second))
+db, err := luima.ConnectWith(os.Getenv("DATABASE_URL"), luima.StatementTimeout(5*time.Second))
 ```
 
-A query that exceeds it comes back as SQLSTATE `57014`, which `luima.SQLState` reads; a client-side
-deadline gives you `context.DeadlineExceeded` and no SQLSTATE, which is how you tell the two apart.
-Setting `statement_timeout` on the role does the same thing one layer down, and is the better answer
-when more than one application shares the role.
+`?statement_timeout=5s` in the DSN does the same, now that pgdriver sends a parameter it does not
+recognize as a `SET` on every new connection. Setting it on the Postgres role does it one layer
+down, and is the better answer when more than one application shares the role.
+
+**Keep it under both client-side limits, or its SQLSTATE never arrives.** `Connect` keeps pgdriver's
+socket timeouts — 10s to read, 5s to write (`newDefaultConfig`) — because they are the only bound on
+the I/O pgdriver does without a caller's context: the rows after a query's row description, `COMMIT`
+and `ROLLBACK`, and the startup of every connection `database/sql` dials in the background. The read
+waiting for a statement's answer therefore ends at the earlier of that 10s and the request's
+deadline. A `statement_timeout` at or above either one still stops the statement in Postgres, but by
+then the caller has had an i/o timeout, and nothing on this side can tell that is what bounded it.
+Raise `ReadTimeout` — with `?read_timeout=` or a `ConnectWith` tune — when a statement is allowed to
+run long, and raise `RequestTimeout` with it.
+
+Telling the two apart: a statement Postgres cancelled comes back as SQLSTATE `57014`, which
+`luima.SQLState` reads. A client-side bound carries no SQLSTATE at all, and which error it does
+carry depends on which of those three places the request was standing in — so do not branch on one
+spelling of it. Blocked on the socket, it is that deadline expiring: a `net.Error` reading
+`i/o timeout`, never `context.DeadlineExceeded`, whether the request's deadline set it or — reading
+rows, which pgdriver does without the context — `ReadTimeout` alone did. Queued for a connection it
+is the context's own error, and so is a deadline that lands between two rows: `awaitDone` stores
+`ctx.Err()`, stops `Next`, and returns it from `Rows.Err()`, which is what bun's scan returns.
+
+**And a timeout costs a connection.** `(*pgdriver.Conn).checkBadConn` closes the connection on
+57014, and on any error that is not a `pgdriver.Error` at all — a client-side i/o timeout included.
+It runs only in `ExecContext` and `QueryContext`, so a 57014 read there, by an `Exec` or by a query
+before its row description arrives, costs the pool that connection, while one message later, during
+row iteration (`rows.next`), the same error leaves it pooled. A client-side timeout costs it at the
+first point for the same reason, and at the second only when the drain behind it cannot finish:
+`rows.Close` reads the rest of the result set — on `context.TODO()`, the caller's deadline already
+past — and closes the connection for any error but `io.EOF`. The next request then pays a dial, a
+TLS handshake, a startup and the `SET`s again, so a flood of timeouts is also a flood of reconnects;
+and inside a transaction, a closed connection fails every later statement, `COMMIT` included, with
+`driver.ErrBadConn`.
 
 The HTTP timeouts are set for you as of `ReadTimeout`/`WriteTimeout`: read defaults to 10s and write
 to 30s, and read also bounds the keep-alive wait, since fasthttp falls back to it when `IdleTimeout`
@@ -219,16 +267,33 @@ JSON body does reach it, and passes through as gqlgen's own text with the body e
 message. What is disclosed on these paths is the caller's own bytes, not the server's, but do not
 treat "everything goes through `PresentError`" as a reason to skip sanitizing something.
 
-With `sslmode` absent from your connection URL, `pg.ParseURL` returns
-`&tls.Config{InsecureSkipVerify: true}` — TLS is on, but the certificate is **not verified**. Use
-`?sslmode=verify-full`. See [docs/deployment.md](docs/deployment.md).
+With `sslmode` absent from your connection URL, TLS is on and the certificate is **not verified**,
+`sslrootcert` or not. With neither parameter present `parseDSN` never enters its `sslmode` switch,
+so every connection keeps the `&tls.Config{InsecureSkipVerify: true}` pgdriver's `newDefaultConfig`
+starts from; an `sslrootcert` on its own does enter it — the switch is guarded on either parameter —
+and lands in the empty case beside `allow` and `prefer`, which sets `InsecureSkipVerify` itself and
+then loads roots nothing checks. Use `?sslmode=verify-full`.
 
-`luima.Connect` fills in the `ServerName` that `pg.ParseURL` leaves empty, because without it
-crypto/tls refuses the handshake outright and `verify-full` cannot connect at all. Before 0.2.0 it
-could not; if you worked around that by falling back to `?sslmode=require`, that is
-`InsecureSkipVerify: true` and worth changing back.
+**`?sslmode=verify-ca` verifies less than it did.** go-pg mapped `verify-ca` and `verify-full` to
+one bare `&tls.Config{}`, which checks the host name too. pgdriver implements Postgres's own
+definition — `InsecureSkipVerify: true` plus a `VerifyPeerCertificate` that calls
+`x509.Certificate.Verify` with no `DNSName` — so any certificate your roots trust now passes,
+whatever host it names. A DSN that says `verify-ca` should say `verify-full`.
 
-`Connect`'s errors never contain the connection string, so logging one does not leak the password.
+luima no longer fills `ServerName`, because pgdriver sets it from the URL's authority for `require`,
+`verify-ca` and `verify-full` alike. One shape still reaches crypto/tls's refusal to handshake with
+neither `ServerName` nor `InsecureSkipVerify` set — a host named only with `?host=`, whose authority
+is empty. Set `c.TLSConfig.ServerName` in a `ConnectWith` tune for that one. Falling back to
+`?sslmode=require` is the workaround the same refusal invited before 0.2.0, and it is
+`InsecureSkipVerify: true`. See [docs/deployment.md](docs/deployment.md).
+
+`Connect`'s errors never contain the connection string or its password, so logging one does not leak
+the credential. That is worth stating because through 0.5.0 it was not quite true: `url.Parse`
+quotes the input it rejects, and an unescaped `/`, `?` or `#` in a password ends the URL's authority
+early, so `postgres://app:Xk9/Q@db/app` failed with `invalid port ":Xk9" after host` — the
+password's first part, into whatever the call site does with a startup error. Every quoted fragment
+is now replaced, and a DSN whose user info was cut short is refused before pgdriver can dial part of
+the password and name it in a `connection refused`.
 
 ## Supply chain
 

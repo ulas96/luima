@@ -9,8 +9,13 @@ r.All(endpoint, adaptor.HTTPHandlerWithContext(withFiberContext(srv)))
 ```
 
 `adaptor.HTTPHandlerWithContext` wraps `fasthttpadaptor`, converting fasthttp's `RequestCtx` into
-an `*http.Request` **per request**. Never plain `HTTPHandler` on this route: that variant hands the
-resolver the raw `*fasthttp.RequestCtx`, which reports no deadline and never cancels.
+an `*http.Request` **per request**, and stashes Fiber's own request context where `withFiberContext`
+can unwrap it onto that request. Never plain `HTTPHandler` on this route: it stashes nothing, so the
+resolver is left with the raw `*fasthttp.RequestCtx`, which satisfies `context.Context` only
+nominally — `Deadline` reports none, and `Done` closes on server shutdown rather than when the
+client hangs up. Nothing luima sets could impose a deadline on it — `RequestTimeout` works through
+Fiber's `c.SetContext`, and `HTTPHandlerWithContext` is the only side that carries that across — and
+resolver code that respects cancellation would be dead code that reads as correct.
 
 > **Be clear about what that buys.** Fiber here provides routing, middleware and its ecosystem —
 > **not** speed. gqlgen does exactly the work it always did, plus a conversion. Anyone telling you
@@ -111,10 +116,14 @@ Two things did block them:
   after `Configure`.
 - **fasthttp does not cancel the request context when the client hangs up.** Measured: the client
   closed the connection after three frames and the resolver was still producing twenty frames later,
-  with `ctx.Err() == nil`. For a query that is survivable, because `RequestTimeout` bounds it at
-  15s. For a subscription it is not — a subscription has to disable `RequestTimeout` to live longer
-  than 15s, and disabling it removes the only bound there is, so an abandoned subscription holds a
-  goroutine and its database work forever. **This one is upstream**, and it is the real blocker.
+  with `ctx.Err() == nil`. For a query that is survivable, because `RequestTimeout` deadlines the
+  resolver context at 15s and the abandoned goroutine unwinds when it expires — *the goroutine*, and
+  that is the whole of it. pgdriver never sends a CancelRequest, so a statement whose client stopped
+  waiting keeps running on Postgres, and only `statement_timeout` (`luima.StatementTimeout`, or
+  `?statement_timeout=` in the DSN) stops it; pair the two rather than assume one implies the other.
+  For a subscription even the goroutine is unbounded — a subscription has to disable
+  `RequestTimeout` to live longer than 15s, and disabling it removes the only bound there is.
+  **This one is upstream**, and it is the real blocker.
 
 `transport.Websocket` was not measured. The adaptor implements `http.Hijacker` as of fasthttp v1.72
 (`fasthttpadaptor/adaptor.go`), which is the interface gorilla's `Upgrader.Upgrade` type-asserts, so
@@ -128,8 +137,9 @@ it is no longer structurally blocked — but this document does not claim it wor
 srv := handler.New(cfg.Schema)
 ```
 
-Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it gives no way to set an error
-presenter, which makes the [error contract](../README.md#error-handling) impossible.
+Not `handler.NewDefaultServer` — deprecated in v0.17.94, and it registers a transport and extension
+set luima has to choose for itself: `transport.MultipartForm` (gotcha #37's CSRF hole),
+`transport.Websocket` and APQ, with every transport registered before any `Configure` could run.
 
 ```go
 srv.AddTransport(transport.Options{})  // answers the OPTIONS preflight
