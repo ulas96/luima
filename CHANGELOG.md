@@ -108,7 +108,8 @@ against a table that already holds rows.
     `import "github.com/uptrace/bun"` and embeds `bun.BaseModel` tagged `bun:"table:…"` where it
     used to write an unexported `tableName struct{}`, and the `List` resolver it patches in takes a
     `func(q *bun.SelectQuery) *bun.SelectQuery`. Regenerate and the files differ; `writeModel` still
-    refuses to overwrite a model you have since hand-edited.
+    refuses to overwrite a model you have since hand-edited. A field named `BaseModel` is refused
+    before anything is written, because the embedded `bun.BaseModel` already takes that name.
   - Your own `go.mod` swaps `github.com/go-pg/pg/v10` for `github.com/uptrace/bun`, plus
     `driver/pgdriver` wherever you name `ConnectWith`'s tune type. The graph gains
     `go.opentelemetry.io/otel` indirectly as well, because pgdriver sets `EnableTracing: true` in

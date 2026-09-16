@@ -456,6 +456,10 @@ func TestTableFromFieldsRejectsBadIdentifiers(t *testing.T) {
 		// exits 0 and `go build ./...` then fails in the consumer's module.
 		{"underscored field", "User", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "Owner_Name", Type: "string"}}},
 		{"underscored type", "My_Type", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "Name", Type: "string"}}},
+		// The generated struct embeds bun.BaseModel, so a field of that name is declared twice.
+		// format.Source does not type-check, so the run writes every file and gqlgen then fails.
+		{"field named BaseModel", "User", []Field{{Name: "ID", Type: "string", PK: true}, {Name: "BaseModel", Type: "string"}}},
+		{"PK named BaseModel", "User", []Field{{Name: "BaseModel", Type: "string", PK: true}, {Name: "Name", Type: "string"}}},
 	} {
 		if _, err := tableFromFields(tc.typ, tc.fields); err == nil {
 			t.Errorf("%s: expected an error — an unexported or non-identifier name generates a struct field gqlgen cannot bind and code that does not compile", tc.name)

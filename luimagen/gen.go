@@ -58,6 +58,12 @@ func tableFromFields(typeName string, fields []Field) (*modelTable, error) {
 		if err := checkIdent("field name", f.Name); err != nil {
 			return nil, err
 		}
+		// modelSource embeds bun.BaseModel, whose field name is BaseModel, so a field of that name
+		// is declared twice. format.Source does not type-check, so nothing else catches it before
+		// every file is written.
+		if f.Name == "BaseModel" {
+			return nil, fmt.Errorf("field name %q is taken — the generated model embeds bun.BaseModel, which names the table", f.Name)
+		}
 		gql, array, err := scalarType(f.Type)
 		if err != nil {
 			return nil, fmt.Errorf("field %s: %w", f.Name, err)
