@@ -10,6 +10,8 @@ will be listed here under **Changed** with the migration in one line.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-16
+
 luima runs on bun now, so nothing that names a go-pg type compiles until it is re-typed. The
 compiler finds every one of those, and the migration list below is the mapping. It does not find the
 two that matter most: a model's table name moves from an unexported `tableName` field to an embedded
@@ -196,8 +198,9 @@ against a table that already holds rows.
   deadline already passed, and `Connect` puts pgdriver's default back. `$PGPASSWORD` still fills a
   DSN with no password — `Connect` reads it, since pgdriver does not — but there is no further
   fallback to `postgres`, as go-pg had. One more silence to know about: a DSN with no database name
-  connects to `$PGDATABASE`, then `postgres`, where the old parser refused it. Set `application_name` and check `pg_stat_activity` if you want to see which
-  database and user you actually got. `docs/deployment.md` walks the whole DSN.
+  connects to `$PGDATABASE`, then `postgres`, where the old parser refused it. Set
+  `application_name` and check `pg_stat_activity` if you want to see which database and user you
+  actually got. `docs/deployment.md` walks the whole DSN.
 
 - **`?sslmode=verify-ca` still verifies the host name, though pgdriver's does not.** go-pg treated
   `verify-ca` as `verify-full`; pgdriver implements libpq's meaning, a `VerifyPeerCertificate` that
@@ -830,7 +833,8 @@ Auth, pagination, filtering, dataloaders, subscriptions, file upload, migrations
 CLI. Subscriptions are blocked by architecture rather than effort: `adaptor.HTTPHandler` buffers
 the whole response, so a streaming transport cannot work through it.
 
-[Unreleased]: https://github.com/ulas96/luima/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ulas96/luima/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ulas96/luima/releases/tag/v0.6.0
 [0.5.0]: https://github.com/ulas96/luima/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ulas96/luima/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ulas96/luima/releases/tag/v0.3.0
