@@ -109,3 +109,80 @@ func selectionDepth(set ast.SelectionSet, frags ast.FragmentDefinitionList, visi
 	}
 	return depth
 }
+
+// noIntrospection @notice The gqlgen extension behind Config.DisableIntrospection.
+//
+// @dev gqlgen's own gate is inside field resolution: the generated introspectSchema and
+// introspectType return a plain errors.New("introspection disabled"), which gqlgen wraps like a
+// resolver's error, so PresentError redacts it to INTERNAL_SERVER_ERROR and logs it — and any
+// unauthenticated scanner then drives your error-rate alerts with one query. Rejecting the
+// operation here, the way maxDepth does, answers before any field runs, through DispatchError, with
+// a cause-less error PresentError passes through: HTTP 200, INTROSPECTION_DISABLED, no log line.
+//
+// gqlgen's gate stays behind it. opCtx.DisableIntrospection is still true, because Mount does not
+// register extension.Introspection, so a document this walk misses is still refused — redacted.
+type noIntrospection struct{}
+
+// ExtensionName @notice Names the extension in gqlgen's stats and logs.
+//
+// @return string the extension name
+func (noIntrospection) ExtensionName() string { return "LuimaNoIntrospection" }
+
+// Validate @notice Reports nothing to check against the schema.
+//
+// @return error always nil
+func (noIntrospection) Validate(graphql.ExecutableSchema) error { return nil }
+
+// MutateOperationContext @notice Rejects an operation that selects __schema or __type.
+//
+// @param ctx    the request context
+// @param opCtx  the parsed operation
+// @return *gqlerror.Error the rejection, or nil to let the operation run
+func (noIntrospection) MutateOperationContext(_ context.Context, opCtx *graphql.OperationContext) *gqlerror.Error {
+	if !introspects(opCtx.Operation.SelectionSet, opCtx.Doc.Fragments, map[string]bool{}) {
+		return nil
+	}
+	err := gqlerror.Errorf("introspection is disabled")
+	err.Extensions = map[string]any{"code": "INTROSPECTION_DISABLED"}
+	return err
+}
+
+// introspects @notice Reports whether a selection set selects __schema or __type anywhere.
+//
+// @dev Anywhere, not only at the root: gqlparser adds both to the query type's own field list
+// (validator/schema.go), so a field that returns the query type reaches them nested. A spread is
+// resolved through frags, as in selectionDepth, or `{...F}` hides the whole query. __typename is
+// not introspection and is left alone, as gqlgen's own gate leaves it.
+//
+// seen is marked on entry and never cleared. That is the cycle guard, and it is also a memo: a
+// fragment is walked once, because the walk stops at the first match, so a fragment seen before
+// either is being walked or matched nothing. Clearing it, as selectionDepth does, lets a chain of
+// fragments that each spread the next twice cost 2^n.
+//
+// @param set    the selections to walk
+// @param frags  the document's fragment definitions
+// @param seen   the spreads already walked
+// @return bool  true when an introspection field is selected
+func introspects(set ast.SelectionSet, frags ast.FragmentDefinitionList, seen map[string]bool) bool {
+	for _, sel := range set {
+		switch s := sel.(type) {
+		case *ast.Field:
+			if s.Name == "__schema" || s.Name == "__type" || introspects(s.SelectionSet, frags, seen) {
+				return true
+			}
+		case *ast.InlineFragment:
+			if introspects(s.SelectionSet, frags, seen) {
+				return true
+			}
+		case *ast.FragmentSpread:
+			if seen[s.Name] {
+				continue
+			}
+			seen[s.Name] = true
+			if def := frags.ForName(s.Name); def != nil && introspects(def.SelectionSet, frags, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}

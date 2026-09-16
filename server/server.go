@@ -70,10 +70,10 @@ type Config struct {
 	// validation errors through by design, so a caller who guesses "nam" still learns there is
 	// a "name". Do not treat it as a substitute for authorization.
 	//
-	// With it set, a __schema or __type query is answered "internal server error" with
-	// INTERNAL_SERVER_ERROR, and logged. gqlgen reports "introspection disabled" as a plain error
-	// from resolving that field (ExecutionContextState.IntrospectSchema), and PresentError cannot
-	// tell it from a resolver's.
+	// With it set, an operation that selects __schema or __type is refused before any field
+	// runs: "introspection is disabled", INTROSPECTION_DISABLED in extensions, HTTP 200, and no
+	// log line, like a depth rejection. gqlgen's own gate, which reports the same thing as a
+	// plain error from resolving the field and so reads as INTERNAL_SERVER_ERROR, stays behind it.
 	DisableIntrospection bool
 
 	// RequestTimeout @notice Deadline for the whole request, propagated into the resolver
@@ -438,6 +438,8 @@ func Mount(r fiber.Router, cfg Config) {
 	// handler.New adds no extensions; without this the playground's docs pane is blind.
 	if !cfg.DisableIntrospection {
 		srv.Use(extension.Introspection{})
+	} else {
+		srv.Use(noIntrospection{})
 	}
 	if n := cfg.ComplexityLimit; n >= 0 {
 		if n == 0 {

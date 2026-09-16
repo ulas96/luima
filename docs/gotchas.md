@@ -135,11 +135,12 @@ cause — so a presenter that trusts a missing cause forwards whatever that serv
 `gqlerror.Errorf(...)` from a resolver or a directive is redacted too, and so is a panic, and so is
 everything sent with `graphql.AddError` or `graphql.AddErrorf` that is not a `*CustomError`.
 
-Two consequences read like bugs. With `DisableIntrospection` set, a `__schema` query is answered
-`internal server error` instead of gqlgen's `introspection disabled`. And a client's bad value for a
-custom scalar — `"yesterday"` for gqlgen's built-in `Time` — is answered the same way, because the
-presenter cannot tell gqlgen's unmarshalling text from yours. `UnmarshalGQL` can return a
-`*CustomError` and be heard, which for `Time` means binding a scalar of your own.
+One consequence reads like a bug. A client's bad value for a custom scalar — `"yesterday"` for
+gqlgen's built-in `Time` — is answered `internal server error`, because the presenter cannot tell
+gqlgen's unmarshalling text from yours. `UnmarshalGQL` can return a `*CustomError` and be heard, on
+the argument's path, which for `Time` means binding a scalar of your own. (`DisableIntrospection`
+would read the same way, and does not: `Mount` refuses a `__schema` or `__type` operation before any
+field runs, with `INTROSPECTION_DISABLED`.)
 
 ```go
 return nil, &luimaerr.CustomError{

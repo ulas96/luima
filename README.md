@@ -497,9 +497,9 @@ resolver's or a directive's error, anything sent with `graphql.AddError` or `gra
 panic, and a `*gqlerror.Error` built by your own code — `gqlerror.Errorf(...)`, or a list decoded
 from another GraphQL server. gqlgen wraps a resolver's plain error in a `*gqlerror.Error` before
 the presenter sees it, so the type alone proves nothing. The rule also covers gqlgen's own errors
-from that stage: a null where the schema forbids one, `introspection disabled` when
-`DisableIntrospection` is set, and a client's bad value for a custom scalar such as gqlgen's
-`Time`. A `*CustomError` is heard from a resolver, a directive or an `UnmarshalGQL` alike, so a
+from that stage: a null where the schema forbids one, and a client's bad value for a custom scalar
+such as gqlgen's `Time`. (With `DisableIntrospection` set, a `__schema` or `__type` query never
+gets that far: `Mount` refuses the operation first, with `INTROSPECTION_DISABLED` and no log line.) A `*CustomError` is heard from a resolver, a directive or an `UnmarshalGQL` alike, so a
 scalar that should explain its format to the client has to be your own.
 
 Do not share one `*gqlerror.Error` value between requests. gqlgen writes the first request's path

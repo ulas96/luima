@@ -166,23 +166,6 @@ func TestPresentErrorOverHTTP(t *testing.T) {
 			hidden:  secret,
 		},
 		{
-			// gqlgen's own text, but returned as a plain error while __schema resolves
-			// (ExecutionContextState.IntrospectSchema, called here as generated code calls it), so
-			// the presenter cannot tell it from a resolver's. Redacted and logged, deliberately.
-			name:  "gqlgen's introspection-disabled error",
-			cfg:   server.Config{DisableIntrospection: true},
-			query: "{__schema{queryType{name}}}",
-			resolve: func(ctx context.Context) (any, error) {
-				schema, err := graphql.NewExecutionContextState[any, any, any](
-					graphql.GetOperationContext(ctx), &graphql.ExecutableSchemaState[any, any, any]{}, nil, nil,
-				).IntrospectSchema()
-				return schema, err
-			},
-			path:      "__schema",
-			locations: []gqlerror.Location{{Line: 1, Column: 2}},
-			hidden:    "introspection disabled",
-		},
-		{
 			// A client's bad value for gqlgen's built-in Time. gqlparser does not check custom
 			// scalars, so graphql.UnmarshalTime's text is the only report, wrapped on the argument's
 			// path — which the redacted error keeps, because ctx only knows the field's.

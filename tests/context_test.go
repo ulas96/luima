@@ -218,6 +218,63 @@ func TestDisableIntrospection(t *testing.T) {
 	}
 }
 
+// TestDisableIntrospectionRejectsTheOperation @notice Asserts an introspection query is refused
+// as an operation, with a code of its own, rather than answered as a server error.
+//
+// @dev gqlgen's gate is inside field resolution: introspectSchema returns a plain
+// errors.New("introspection disabled"), which PresentError cannot tell from a resolver's error, so
+// every scanner's __schema probe came back INTERNAL_SERVER_ERROR and wrote a "resolver error" log
+// line — error-rate alerts driven by anyone. The resolver here calls that gate as generated code
+// does, so a Mount that stopped rejecting the operation up front fails on the message and the log.
+//
+// The spread and the inline fragment are the reason the walk exists: a check of the root
+// selections' names alone passes both. __typename is not introspection and must still resolve.
+//
+// @param t the test handle
+func TestDisableIntrospectionRejectsTheOperation(t *testing.T) {
+	gate := func(ctx context.Context) (any, error) {
+		return graphql.NewExecutionContextState[any, any, any](
+			graphql.GetOperationContext(ctx), &graphql.ExecutableSchemaState[any, any, any]{}, nil, nil,
+		).IntrospectSchema()
+	}
+	cfg := server.Config{DisableIntrospection: true, Schema: newResolverStubSchema(gate)}
+
+	for _, query := range []string{
+		"{__schema{queryType{name}}}",
+		`{__type(name: "Query"){name}}`,
+		"{...F} fragment F on Query {__schema{queryType{name}}}",
+		`{... on Query {__type(name: "Query"){name}}}`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			logged := captureLog(t)
+			errs, body := presentOverHTTP(t, cfg, query)
+
+			if len(errs) != 1 {
+				t.Fatalf("response %s carries %d errors, want 1", body, len(errs))
+			}
+			if got := errs[0].Message; got != "introspection is disabled" {
+				t.Errorf("message = %q, want %q", got, "introspection is disabled")
+			}
+			if code := errs[0].Extensions["code"]; code != "INTROSPECTION_DISABLED" {
+				t.Errorf("extensions.code = %v, want INTROSPECTION_DISABLED", code)
+			}
+			if logged.Len() != 0 {
+				t.Errorf("a refused introspection query was logged: %q", logged)
+			}
+		})
+	}
+
+	t.Run("__typename is not introspection", func(t *testing.T) {
+		errs, body := presentOverHTTP(t, server.Config{
+			DisableIntrospection: true,
+			Schema:               newResolverStubSchema(func(context.Context) (any, error) { return "pong", nil }),
+		}, "{__typename}")
+		if len(errs) != 0 {
+			t.Errorf("response %s refused __typename", body)
+		}
+	})
+}
+
 // TestPanicLeaksNoStack @notice Asserts a panicking resolver produces no stack frame on the wire.
 //
 // @dev Three recovers now sit in this stack — gqlgen's DefaultRecover, the timeout middleware's,

@@ -280,13 +280,12 @@ against a table that already holds rows.
   GraphQL response; a resolver panic, whether gqlgen's default recover function answers it (its
   `internal system error` carried no code) or one installed with `SetRecoverFunc` does; gqlgen's
   null violations (`must not be null`, `the requested element is null which the schema does not
-  allow`); `introspection disabled`, for a `__schema` or `__type` query when
-  `DisableIntrospection` is set; a client's bad value for a custom scalar, gqlgen's built-in `Time`
-  included; and a variable default that does not parse for a custom scalar, which is still answered
-  HTTP 422 but with `INTERNAL_SERVER_ERROR` in place of `GRAPHQL_VALIDATION_FAILED`. Each of these
-  also writes a `resolver error` log line, so any client can produce one at will — a `__schema`
-  query with introspection disabled is enough — and an alert keyed on `INTERNAL_SERVER_ERROR` sees
-  it.
+  allow`); a client's bad value for a custom scalar, gqlgen's built-in `Time` included; and a
+  variable default that does not parse for a custom scalar, which is still answered HTTP 422 but
+  with `INTERNAL_SERVER_ERROR` in place of `GRAPHQL_VALIDATION_FAILED`. Each of these also writes a
+  `resolver error` log line, so any client that can send a bad `Time` can produce one at will, and
+  an alert keyed on `INTERNAL_SERVER_ERROR` sees it. gqlgen's own `introspection disabled` would be
+  on this list, which is why `DisableIntrospection` no longer reaches it — see the next entry.
 
   **Migration:** send a message meant for the client as a `*luimaerr.CustomError`, whose `Code`
   becomes `extensions.code`. It is heard from a resolver, a directive, a recover function or an
@@ -294,6 +293,13 @@ against a table that already holds rows.
   client has to be your own rather than gqlgen's built-in binding. Do not share one
   `*gqlerror.Error` value between requests: gqlgen writes the first request's path and locations
   into it.
+
+- **`DisableIntrospection` refuses the operation, before any field runs.** A `__schema` or `__type`
+  selection anywhere in the document, a fragment included, is answered `introspection is disabled`
+  with `extensions.code` `INTROSPECTION_DISABLED`, HTTP 200, and no log line — the shape of a depth
+  rejection. It used to reach gqlgen's field-level gate, whose plain `introspection disabled` the
+  entry above redacts and logs, so one unauthenticated query wrote a log line and moved an
+  error-rate alert. gqlgen's gate still stands behind the new check.
 
 - **`db.Connect`'s parse error could carry the start of the password.** `0.2.0` dropped the raw DSN
   from that error by keeping only the `*url.Error`'s `Op` and `Err`, and the narrower leak survived
