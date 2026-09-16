@@ -599,6 +599,40 @@ func TestConnectDSNParity(t *testing.T) {
 			}
 		})
 	}
+
+	// The cut-short guard scans the query only as far as its first =, so an @ in a parameter's
+	// value is the operator's. Both directions, because widening it back to all of RawQuery
+	// refuses every well-formed DSN below, and narrowing it further lets the ? shape dial.
+	for _, cut := range []struct{ name, dsn string }{
+		{"at a hash, into the fragment", "postgres://127.0.0.1:2024#x@db/app"},
+		{"at a slash, into the path", "postgres://app:p@ss/x@db/app"},
+		{"at a question mark, into the query", "postgres://u:2024?ss@host/db"},
+	} {
+		t.Run("user info cut short "+cut.name+" is refused", func(t *testing.T) {
+			_, called, err := connect(t, cut.dsn)
+			if called {
+				t.Errorf("tune ran, so the DSN was accepted (ConnectWith = %v) — a cut-short user info must be refused before anything dials", err)
+			}
+			if !strings.HasPrefix(err.Error(), "parse database url:") {
+				t.Errorf("ConnectWith = %v, want a parse error", err)
+			}
+		})
+	}
+
+	for _, ok := range []struct{ name, dsn string }{
+		{"with user info", "postgres://u:p@127.0.0.1/d?sslmode=disable&application_name=api@prod"},
+		{"without user info", "postgres://127.0.0.1/d?sslmode=disable&application_name=api@prod"},
+	} {
+		t.Run("an @ in a parameter's value is accepted, "+ok.name, func(t *testing.T) {
+			seen, called, err := connect(t, ok.dsn)
+			if !called {
+				t.Fatalf("tune never ran (ConnectWith = %v) — ?application_name=api@prod is well formed, and the cut-short guard must not refuse it", err)
+			}
+			if seen.Addr != "127.0.0.1:5432" {
+				t.Errorf("Addr = %q, want %q — the @ in the query must not move the host", seen.Addr, "127.0.0.1:5432")
+			}
+		})
+	}
 }
 
 // TestStatementTimeout @notice Proves the bound is enforced by Postgres, not by the client.

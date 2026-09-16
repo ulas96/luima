@@ -128,8 +128,10 @@ host and `2024`, the start of the password, becomes the port, for pgdriver to di
 `dial tcp 127.0.0.1:2024: connect: connection refused`; and `postgres://app:p@ss/x@db/app`, which
 dials the host `ss`. `Connect` refuses the shapes that parse before anything dials: what they have
 in common, and a well-formed DSN almost never has, is the `@` that should have ended the user info
-sitting outside the authority — in the path, query or fragment — and a DSN that means it can write
-that one `%40`. The shape `url.Parse` itself rejects comes back with every quoted fragment
+sitting outside the authority — in the path, in the fragment, or ahead of the first `=` in the
+query — and a DSN that means it can write that one `%40`. An `@` past that first `=` is a
+parameter's value and is left alone, so `?application_name=api@prod` needs no encoding. The shape
+`url.Parse` itself rejects comes back with every quoted fragment
 replaced and the same advice appended. No error `Connect` returns quotes the DSN or the password;
 in 0.5.0 the parse error carried the password's first part.
 

@@ -217,8 +217,15 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 //     error that ConnectWith returns names the host and port it dialed, which is to say part of
 //     the password: "dial tcp 127.0.0.1:2024: connect: connection refused", "lookup ss: no such
 //     host". What every such DSN has, and a well-formed one almost never does, is the @ that should
-//     have ended the user info outside the authority, in the path, query or fragment; one that
-//     means it can write it as %40. This check, and the next, run outside openConnector because
+//     have ended the user info outside the authority — in the path, in the fragment, or ahead of
+//     the first = in the query; one that means it can write it as %40. The query is scanned only
+//     that far because url.Parse cuts it at the first ?, before it parses the authority, so a
+//     password's ? puts the rest of the user info at the front of RawQuery, where a real parameter
+//     has already spent its first =. Scanning the whole of it refused ?application_name=api@prod,
+//     which is well formed, and which deployment.md tells you to set. What still passes is a
+//     password like 2024?a=b — an = before the @, and a digits-only prefix for validOptionalPort
+//     to take as the port; refusing that costs more code than the u:2024 it leaks to the dial
+//     error is worth. This check, and the next, run outside openConnector because
 //     their errors quote nothing, and redact's password check would withhold them whenever the
 //     password is short enough to occur in their wording.
 //   - ?password= and ?sslpassword=. libpq reads both; pgdriver reads neither, so each becomes a
@@ -252,11 +259,15 @@ func ConnectWith(url string, tune func(*pgdriver.Config)) (*bun.DB, error) {
 // @return error               "parse database url: ...", with url and its password redacted
 func connector(url string) (*pgdriver.Connector, error) {
 	u, err := neturl.Parse(url)
-	if err == nil && strings.Contains(u.Opaque+u.EscapedPath()+u.RawQuery+u.EscapedFragment(), "@") {
-		return nil, errors.New("parse database url: the user info ends before its @ " +
-			"(percent-encode any / ? # or % in the user or password, and write any @ past the host as %40)")
-	}
 	if err == nil {
+		// The query only as far as its first =. Past that is a parameter's value, where an @ is
+		// the operator's, not a cut-short user info's: scanning all of RawQuery refuses
+		// ?application_name=api@prod.
+		q, _, _ := strings.Cut(u.RawQuery, "=")
+		if strings.Contains(u.Opaque+u.EscapedPath()+q+u.EscapedFragment(), "@") {
+			return nil, errors.New("parse database url: the user info ends before its @ " +
+				"(percent-encode any / ? # or % in the user or password, and write any @ past the host as %40)")
+		}
 		for k := range u.Query() {
 			if n := strings.ToLower(strings.Trim(k, `"`)); n == "password" || n == "sslpassword" {
 				return nil, errors.New("parse database url: ?" + n + "= is not read by pgdriver, which would send it " +

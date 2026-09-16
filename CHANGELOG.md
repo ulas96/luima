@@ -227,8 +227,13 @@ against a table that already holds rows.
   all against `127.0.0.1:2024`, where `2024` is where the password started. `0.5.0` happened to
   refuse the `?` and `#` shapes, because they leave the path empty and `pg.ParseURL` answered
   `database name not provided`; it accepted the `/` shape, and pgdriver defaults a missing database
-  anyway. **Migration:** percent-encode `/ ? # %` in the user or password, and write any `@` past
-  the host as `%40`.
+  anyway. The tell is an `@` outside the authority, and it is looked for in the path, in the
+  fragment, and in the query only as far as its first `=` — past that is a parameter's value, where
+  an `@` is the operator's: `?application_name=api@prod` is well formed and is left alone. What
+  still gets through is a password like `2024?a=b`, an `=` before the `@` with a digits-only prefix
+  for `url.Parse` to read as the port. **Migration:** percent-encode `/ ? # %` in the user or
+  password, and write any `@` past the host as `%40` — except in a parameter's value, which needs
+  no encoding.
 
 ### Removed
 
