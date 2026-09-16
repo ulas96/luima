@@ -35,8 +35,9 @@ func ExampleCustomError() {
 
 // ExampleSQLState @notice Branching on a Postgres SQLSTATE.
 //
-// @dev Replaces an errors.As dance whose target type is easy to get wrong: pg.Error is an
-// interface, not a struct pointer, and not pgx's *pgconn.PgError.
+// @dev Replaces an errors.As dance whose target type is easy to get wrong: pgdriver.Error is a
+// struct value, so a *pgdriver.Error target compiles and never matches — and it is not pgx's
+// *pgconn.PgError either.
 func ExampleSQLState() {
 	err := errors.New("not a driver error")
 

@@ -113,9 +113,13 @@ func TestResolverContext(t *testing.T) {
 // been read, so the resolver never sees it: this test hangs until app.Test's own 1s timeout
 // instead of returning 408.
 //
-// The cancellation half is the part that matters in production. go-pg turns ctx.Done() into a
-// Postgres CancelRequest, so a resolver context that never cancels means an abandoned request
-// still runs its query to completion.
+// The cancellation half is the part that matters in production, though not because it stops the
+// query: pgdriver never asks Postgres to cancel a statement, so the statement runs on either way,
+// and StatementTimeout is its only server-side bound. What it stops is the waiting. database/sql
+// gives up on a pooled connection when ctx is done ((*sql.DB).conn), and pgdriver caps the socket
+// deadline at ctx.Deadline() ((*pgdriver.Conn).deadline). A resolver context that never cancels
+// queues indefinitely behind a saturated pool, and sits out pgdriver's whole 10s ReadTimeout on a
+// slow statement.
 //
 // @param t the test handle
 func TestRequestTimeout(t *testing.T) {

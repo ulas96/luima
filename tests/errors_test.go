@@ -3,20 +3,24 @@ package tests
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/99designs/gqlgen/graphql/handler"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
+	"github.com/ulas96/luima/db"
 	"github.com/ulas96/luima/luimaerr"
 	"github.com/ulas96/luima/server"
 )
@@ -32,7 +36,7 @@ import (
 // @param t the test handle
 func TestPresentError(t *testing.T) {
 	ctx := context.Background()
-	leak := errors.New(`ERROR: duplicate key value violates unique constraint "app_users_pkey" (SQLSTATE 23505)`)
+	leak := errors.New(`ERROR: duplicate key value violates unique constraint "app_users_pkey" (SQLSTATE=23505)`)
 
 	if got := luimaerr.PresentError(ctx, &luimaerr.CustomError{UserMessage: "nope", InternalError: leak}).Message; got != "nope" {
 		t.Errorf("CustomError presented as %q", got)
@@ -98,7 +102,7 @@ func TestPresentError(t *testing.T) {
 // @param t the test handle
 func TestPresentErrorOverHTTP(t *testing.T) {
 	const secret = "app_users_pkey"
-	leak := errors.New(`ERROR #23505 duplicate key value violates unique constraint "` + secret + `"`)
+	leak := errors.New(`ERROR: duplicate key value violates unique constraint "` + secret + `" (SQLSTATE=23505)`)
 
 	// One case per route by which gqlgen hands the presenter an error it cannot vouch for. hidden is
 	// what went wrong: it must be absent from the body and present in the log.
@@ -435,8 +439,8 @@ func TestCustomErrorUnwrap(t *testing.T) {
 
 // TestSQLState @notice Covers the non-driver case.
 //
-// @dev The positive case needs a real Postgres error and is asserted end to end by TestCRUD, via
-// the duplicate Create.
+// @dev The end-to-end case — a 23505 from a real Create — is TestCRUD's, and it needs a database.
+// TestSQLStateReadsAWireError covers the same branch without one.
 //
 // @param t the test handle
 func TestSQLState(t *testing.T) {
@@ -445,5 +449,91 @@ func TestSQLState(t *testing.T) {
 	}
 	if got := luimaerr.SQLState(nil); got != "" {
 		t.Errorf("SQLState(nil) = %q, want %q", got, "")
+	}
+}
+
+// TestSQLStateReadsAWireError @notice Reads a SQLSTATE off a stub server's ErrorResponse, with no
+// database.
+//
+// @dev The type argument in SQLState is pgdriver.Error, a struct *value*: readError builds it as
+// Error{m: m} and nothing in pgdriver takes its address. Written *pgdriver.Error it still compiles,
+// because the pointer has the value's methods too, and never matches — every SQLSTATE branch behind
+// it becomes dead code that reads as correct. Until this test that was pinned only by the DB-gated
+// tests: crud_test.go's 23505 and 23502, db_test.go's 57014. A `go test ./...` with no
+// DATABASE_URL — the run CI cannot make and a contributor usually does — stayed green through it.
+//
+// Off the wire rather than out of a constructor, because there is no constructor: Error's one field
+// is unexported, so the only way to hold one from outside pgdriver is to make a server produce it.
+// The stub answers the startup packet with an ErrorResponse — 'E', the length, then typed
+// NUL-terminated fields and a NUL — and pgdriver's startup returns it unwrapped for a FATAL, while
+// Connect wraps it with %w. So this pins the whole chain from Connect's error back to the code,
+// which is what a resolver's classification walks.
+//
+// @param t the test handle
+func TestSQLStateReadsAWireError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// 28P01 invalid_password: any code would do, but this is one a real server sends during
+	// startup, which is the only exchange this stub speaks.
+	var body bytes.Buffer
+	for _, f := range []struct {
+		k byte
+		v string
+	}{
+		{'S', "FATAL"},
+		{'V', "FATAL"}, // readError keys on V: FATAL is what makes startup return it as the error
+		{'C', "28P01"},
+		{'M', `password authentication failed for user "u"`},
+	} {
+		body.WriteByte(f.k)
+		body.WriteString(f.v)
+		body.WriteByte(0)
+	}
+	body.WriteByte(0) // the field list ends with a bare NUL
+
+	msg := make([]byte, 5, 5+body.Len())
+	msg[0] = 'E'
+	binary.BigEndian.PutUint32(msg[1:], uint32(body.Len()+4)) // the length counts itself
+	msg = append(msg, body.Bytes()...)
+
+	// Accept in a loop: database/sql opens a connection per attempt, and nothing here should turn a
+	// second dial into a hang.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+				// The startup packet is int32 length — counting itself — then that many bytes.
+				var hdr [4]byte
+				if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+					return
+				}
+				n := binary.BigEndian.Uint32(hdr[:])
+				if n < 4 || n > 1<<16 {
+					return
+				}
+				if _, err := io.ReadFull(conn, make([]byte, n-4)); err != nil {
+					return
+				}
+				_, _ = conn.Write(msg)
+			}()
+		}
+	}()
+
+	_, connErr := db.Connect("postgres://u:p@" + ln.Addr().String() + "/d?sslmode=disable&connect_timeout=5")
+	if connErr == nil {
+		t.Fatal("Connect against a stub that answers with an ErrorResponse returned no error")
+	}
+	if got := luimaerr.SQLState(connErr); got != "28P01" {
+		t.Errorf("SQLState(%v) = %q, want %q — the pgdriver.Error branch did not match a driver error off the wire", connErr, got, "28P01")
 	}
 }

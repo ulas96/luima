@@ -16,7 +16,7 @@ import (
 	"slices"
 
 	"github.com/99designs/gqlgen/graphql"
-	"github.com/go-pg/pg/v10"
+	"github.com/uptrace/bun/driver/pgdriver"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 )
 
@@ -39,7 +39,7 @@ type CustomError struct {
 	// InternalError @notice The cause, kept for the log and for errors.Is/As.
 	//
 	// @dev gqlgen's own reference server stores a string here; keeping the error means the
-	// underlying pg.Error stays reachable, which is what makes SQLState work on a wrapped
+	// underlying pgdriver.Error stays reachable, which is what makes SQLState work on a wrapped
 	// error.
 	InternalError error
 
@@ -75,7 +75,7 @@ func (e *CustomError) Unwrap() error { return e.InternalError }
 // PresentError @notice The server's error contract, and Config.ErrorPresenter's default.
 //
 // @dev gqlgen's default presenter forwards err.Error() verbatim. That would hand an
-// unauthenticated client raw driver strings ("... SQLSTATE 23505") and with them the table's
+// unauthenticated client raw driver strings ("... (SQLSTATE=23505)") and with them the table's
 // column and constraint names. luima ships no auth, so this redaction is the only thing between
 // a caller and the schema.
 //
@@ -165,15 +165,20 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	// and anything parsing these logs per line can be lied to. %q escapes them and makes the
 	// boundary of the untrusted string visible.
 	//
-	// Note what this line is not: redaction happens on the wire, not here. A Postgres error's
-	// DETAIL field carries the offending row's values — Key (email)=(victim@example.com) — so
-	// the data withheld from the client above is written to stdout in full. That is deliberate,
-	// it is what makes an incident debuggable, and it means your log store inherits the
-	// database's confidentiality requirements. See SECURITY.md.
+	// Note what this line is not: redaction happens on the wire, not here. What is withheld from
+	// the client above is written to stderr in full — your table, column and constraint names, and
+	// whatever of the client's own input Postgres quoted back into the message. Not the row's
+	// values: (pgdriver.Error).Error stops after the SQLSTATE, so the DETAIL field that carries
+	// them — Key (email)=(victim@example.com) — is reachable with Field('D') and is nowhere in this
+	// line. That is deliberate, it is what makes an incident debuggable, and it means your log
+	// store inherits your schema, if not your rows. See SECURITY.md.
 	//
 	// When err is gqlgen's wrapper, %q renders it through (*gqlerror.Error).Error, which puts
-	// gqlparser's position in the client's document first: "input:1:2: ping ERROR #23505 ...".
-	// "input" is gqlparser's default source name, not a file of yours.
+	// gqlparser's position in the client's document first and pgdriver's rendering of the driver
+	// error after it — (pgdriver.Error).Error is "%s: %s (SQLSTATE=%s)" over the severity, message
+	// and code fields — so the line reads "input:1:2: ping ERROR: duplicate key value violates
+	// unique constraint ... (SQLSTATE=23505)". "input" is gqlparser's default source name, not a
+	// file of yours.
 	log.Printf("resolver error: %q", err)
 	redacted := &gqlerror.Error{
 		Message: "internal server error",
@@ -205,21 +210,27 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 //	if luima.SQLState(err) == "23505" { // unique_violation
 //
 // @dev Codes worth classifying: 23505 unique_violation, 23503 foreign_key_violation,
-// 23502 not_null_violation, 23514 check_violation. pg.Error also has IntegrityViolation() bool
-// if one branch for the whole 23xxx class is enough.
+// 23502 not_null_violation, 23514 check_violation, 57014 query_canceled. pgdriver.Error also has
+// IntegrityViolation() bool, a switch over the class-23 codes, if one branch for the whole class
+// is enough, and StatementTimeout() bool for 57014.
 //
-// pg.Error is an *interface* (error + Field(byte) + IntegrityViolation()), not a struct
-// pointer and not pgx's *pgconn.PgError — so the type argument here is pg.Error itself, and the
-// pre-1.27 errors.As spelling of the same thing declares `var pgErr pg.Error` with no `*` and
-// still passes `&pgErr` — errors.As always takes a pointer, and passing pgErr itself panics at the
-// first driver error that reaches it. Getting this
-// wrong is the most common bug when porting error handling between the two drivers: it fails to
-// compile in one direction and silently never matches in the other.
+// pgdriver.Error is a struct *value*: readError builds it as Error{m: m}, nothing in pgdriver takes
+// its address, and Field, IntegrityViolation, StatementTimeout and Error all have value receivers.
+// So the type argument here is pgdriver.Error with no `*`, and the pre-1.26 errors.As spelling of
+// the same thing declares `var pgErr pgdriver.Error` and passes `&pgErr` — errors.As always takes
+// a pointer, and passing pgErr itself panics on the first non-nil error.
+//
+// The `*` is the trap, and it is silent. *pgdriver.Error has the value's methods too, so it is an
+// error: errors.AsType[*pgdriver.Error](err) compiles, and never matches, because the chain holds
+// the value and never a pointer to it — every SQLSTATE branch behind it is dead code that reads as
+// correct. That is the inverse of the trap an interface error type sets, where the same `*` fails
+// to compile, and it is exactly the spelling someone porting from pgx arrives with, because
+// pgx's *pgconn.PgError is a pointer.
 //
 // @param err     any error, including nil and wrapped chains
-// @return string the five-character SQLSTATE, or "" when no pg.Error is in the chain
+// @return string the five-character SQLSTATE, or "" when no pgdriver.Error is in the chain
 func SQLState(err error) string {
-	if pgErr, ok := errors.AsType[pg.Error](err); ok {
+	if pgErr, ok := errors.AsType[pgdriver.Error](err); ok {
 		return pgErr.Field('C')
 	}
 	return ""
