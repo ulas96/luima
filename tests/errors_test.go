@@ -130,8 +130,9 @@ func TestPresentErrorOverHTTP(t *testing.T) {
 				graphql.AddError(ctx, leak)
 				return "pong", nil
 			},
-			path:   "ping",
-			hidden: secret,
+			path:      "ping",
+			locations: []gqlerror.Location{{Line: 1, Column: 2}},
+			hidden:    secret,
 		},
 		{
 			// Not wrapped at all. Err is tagged json:"-", so a decoded error has no cause and only the
@@ -161,19 +162,21 @@ func TestPresentErrorOverHTTP(t *testing.T) {
 			cfg: server.Config{Configure: func(srv *handler.Server) {
 				srv.SetRecoverFunc(func(_ context.Context, r any) error { return gqlerror.Errorf("panic: %v", r) })
 			}},
-			resolve: func(context.Context) (any, error) { panic(leak) },
-			path:    "ping",
-			hidden:  secret,
+			resolve:   func(context.Context) (any, error) { panic(leak) },
+			path:      "ping",
+			locations: []gqlerror.Location{{Line: 1, Column: 2}},
+			hidden:    secret,
 		},
 		{
 			// A client's bad value for gqlgen's built-in Time. gqlparser does not check custom
 			// scalars, so graphql.UnmarshalTime's text is the only report, wrapped on the argument's
 			// path — which the redacted error keeps, because ctx only knows the field's.
-			name:    "gqlgen's error for a bad scalar argument",
-			query:   `{ping(at: "yesterday")}`,
-			resolve: func(context.Context) (any, error) { return "pong", nil },
-			path:    "ping.at",
-			hidden:  "RFC3339Nano",
+			name:      "gqlgen's error for a bad scalar argument",
+			query:     `{ping(at: "yesterday")}`,
+			resolve:   func(context.Context) (any, error) { return "pong", nil },
+			path:      "ping.at",
+			locations: []gqlerror.Location{{Line: 1, Column: 2}},
+			hidden:    "RFC3339Nano",
 		},
 		{
 			// Presented before any field runs, like a validation error, and with its code — but
@@ -249,6 +252,60 @@ func TestPresentErrorOverHTTP(t *testing.T) {
 		}
 		if slices.Contains(errs[0].Locations, gqlerror.Location{Line: 2, Column: 3}) {
 			t.Errorf("locations = %v carry another request's position", errs[0].Locations)
+		}
+	})
+
+	t.Run("an error value shared across requests never carries a deeper path from another request", func(t *testing.T) {
+		captureLog(t)
+		// What gqlgen leaves in a package-level value after reporting it on another request's
+		// { ping { secretAlias: … } }: ErrorOnPath and AddFieldLocationToError fill Path and
+		// Locations in place, and only when they are empty, so this request's reporting adds nothing.
+		shared := gqlerror.Errorf("not found")
+		shared.Path = ast.Path{ast.PathName("ping"), ast.PathName("secretAlias")}
+		shared.Locations = []gqlerror.Location{{Line: 7, Column: 9}}
+		cfg := server.Config{Schema: newResolverStubSchema(func(context.Context) (any, error) { return nil, shared })}
+
+		errs, body := presentOverHTTP(t, cfg, "{ping}")
+
+		if strings.Contains(body, "secretAlias") {
+			t.Errorf("response %s carries another request's alias", body)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("response %s carries %d errors, want 1", body, len(errs))
+		}
+		if p := errs[0].Path.String(); p != "ping" {
+			t.Errorf("path = %q, want this request's %q", p, "ping")
+		}
+		if want := []gqlerror.Location{{Line: 1, Column: 2}}; !slices.Equal(errs[0].Locations, want) {
+			t.Errorf("locations = %v, want this request's %v", errs[0].Locations, want)
+		}
+	})
+
+	t.Run("a CustomError from a scalar argument is heard on the argument's path", func(t *testing.T) {
+		heard := &luimaerr.CustomError{UserMessage: "at must be an RFC 3339 time", InternalError: leak, Code: "BAD_USER_INPUT"}
+		schema := newScalarStubSchema(
+			func(context.Context) (any, error) { return "pong", nil },
+			func(any) (time.Time, error) { return time.Time{}, heard },
+		)
+
+		errs, body := presentOverHTTP(t, server.Config{Schema: schema}, `{ping(at: "yesterday")}`)
+
+		if strings.Contains(body, secret) {
+			t.Errorf("response %s carries InternalError's text", body)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("response %s carries %d errors, want 1", body, len(errs))
+		}
+		got := errs[0]
+		if got.Message != heard.UserMessage {
+			t.Errorf("message = %q, want %q", got.Message, heard.UserMessage)
+		}
+		// Heard is no less precise than redacted: gqlgen wrapped it on ping.at, and ctx reads ping.
+		if p := got.Path.String(); p != "ping.at" {
+			t.Errorf("path = %q, want the argument's %q", p, "ping.at")
+		}
+		if want := []gqlerror.Location{{Line: 1, Column: 2}}; !slices.Equal(got.Locations, want) {
+			t.Errorf("locations = %v, want %v", got.Locations, want)
 		}
 	})
 

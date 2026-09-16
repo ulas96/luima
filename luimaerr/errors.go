@@ -17,6 +17,7 @@ import (
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/uptrace/bun/driver/pgdriver"
+	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 )
 
@@ -105,9 +106,10 @@ func (e *CustomError) Unwrap() error { return e.InternalError }
 // @return *gqlerror.Error the message the client receives, with the field path attached
 func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	if ce, ok := errors.AsType[*CustomError](err); ok {
-		out := &gqlerror.Error{Message: ce.UserMessage, Path: graphql.GetPath(ctx)}
-		// Only when set, so a zero CustomError is byte-identical on the wire to what 0.2.1
-		// sent. An empty code would be worse than none: a client branching on
+		out := &gqlerror.Error{Message: ce.UserMessage}
+		out.Path, out.Locations = answeredAt(ctx, err)
+		// Only when set, so a zero CustomError carries no extensions object, as in 0.2.1. An
+		// empty code would be worse than none: a client branching on
 		// extensions.code == "" has no way to tell "this server does not send codes" from
 		// "this error has no code".
 		if ce.Code != "" {
@@ -182,27 +184,62 @@ func PresentError(ctx context.Context, err error) *gqlerror.Error {
 	log.Printf("resolver error: %q", err)
 	redacted := &gqlerror.Error{
 		Message: "internal server error",
-		Path:    graphql.GetPath(ctx),
 		// Unconditional here, unlike the CustomError branch: this is the one error whose class the
 		// client can be told for free. The message says nothing, so the code says nothing
 		// either — it just spares every Apollo-shaped client a string comparison against
 		// "internal server error", which is the string this function most wants freedom to change.
 		Extensions: map[string]any{"code": "INTERNAL_SERVER_ERROR"},
 	}
-	// Redaction removes what went wrong, never where, and gqlgen has usually recorded where more
-	// precisely than ctx can: an argument that fails to unmarshal is wrapped on ping.at while ctx
-	// still reads ping, and only the wrapper carries locations. Both point into the client's own
-	// document, so they disclose nothing — provided they are this request's. ErrorOnPath and
-	// AddFieldLocationToError write them into an error in place the first time they report it, so
-	// an error value shared across requests arrives carrying the first request's alias and
-	// position. A path that does not extend ctx's is not this field's, and copying it could answer
-	// this client with another client's field names.
-	if isGQL && len(ge.Path) >= len(redacted.Path) &&
-		slices.Equal(ge.Path[:len(redacted.Path)], redacted.Path) {
-		redacted.Path = ge.Path
-		redacted.Locations = ge.Locations
-	}
+	// Redaction removes what went wrong, never where.
+	redacted.Path, redacted.Locations = answeredAt(ctx, err)
 	return redacted
+}
+
+// answeredAt @notice The path and locations PresentError answers err on: the request's own, and
+// never another request's.
+//
+// @dev gqlgen has sometimes recorded where more precisely than ctx can: an argument that fails to
+// unmarshal is wrapped on ping.at while ctx still reads ping. But ErrorOnPath and
+// AddFieldLocationToError write Path and Locations into a *gqlerror.Error in place, and only when
+// they are empty, so an error value shared across requests arrives carrying the first request's
+// alias and position — and a path that merely extends ctx's can be that request's child field,
+// { ping { secretAlias: … } }. What err says is taken only where it cannot be another request's:
+//
+//   - While a field resolves, ctx's path, extended by err's only when the next element names an
+//     argument of this field — the one thing ProcessArgField adds. The locations are this field's
+//     own position in this document, the value AddFieldLocationToError writes into a fresh wrapper.
+//   - Before any field runs — parse, validation, variable coercion, an operation-level limit —
+//     nothing has written into err in place, so its path and locations are the ones gqlparser
+//     built for this document, as long as the path extends ctx's.
+//
+// @param ctx  the request context, read for the field context and the path
+// @param err  the error being presented
+// @return ast.Path              where the error is answered
+// @return []gqlerror.Location   this document's positions for it, or nil
+func answeredAt(ctx context.Context, err error) (ast.Path, []gqlerror.Location) {
+	path := graphql.GetPath(ctx)
+	ge, isGQL := err.(*gqlerror.Error) //nolint:errorlint // gqlgen's wrapper is always the top-level value
+	extends := isGQL && len(ge.Path) >= len(path) && slices.Equal(ge.Path[:len(path)], path)
+
+	fc := graphql.GetFieldContext(ctx)
+	if fc == nil {
+		if extends {
+			return ge.Path, ge.Locations
+		}
+		return path, nil
+	}
+	if fc.Field.Field == nil {
+		return path, nil
+	}
+	if extends && len(ge.Path) > len(path) {
+		if arg, ok := ge.Path[len(path)].(ast.PathName); ok && fc.Field.Arguments.ForName(string(arg)) != nil {
+			path = ge.Path
+		}
+	}
+	if pos := fc.Field.Position; pos != nil && pos.Line > 0 {
+		return path, []gqlerror.Location{{Line: pos.Line, Column: pos.Column}}
+	}
+	return path, nil
 }
 
 // SQLState @notice Returns the Postgres SQLSTATE of err, or "" if err is not a driver error.

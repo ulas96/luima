@@ -287,6 +287,14 @@ against a table that already holds rows.
   an alert keyed on `INTERNAL_SERVER_ERROR` sees it. gqlgen's own `introspection disabled` would be
   on this list, which is why `DisableIntrospection` no longer reaches it — see the next entry.
 
+  The `path` and `locations` on that answer, and on a `*CustomError`'s, are the request's own: the
+  field's path, extended only into one of that field's arguments — which is how gqlgen reports a
+  bad argument, on `ping.at` while the field is `ping` — and the field's own position in the
+  document. They are never copied from the error value, because gqlgen writes both into a
+  `*gqlerror.Error` in place, so a value shared across requests carries the first request's
+  aliases, including a child field's. A `*CustomError` gains `locations` on the wire with this, and
+  one returned from an `UnmarshalGQL` is heard on the argument's path.
+
   **Migration:** send a message meant for the client as a `*luimaerr.CustomError`, whose `Code`
   becomes `extensions.code`. It is heard from a resolver, a directive, a recover function or an
   `UnmarshalGQL` alike, through gqlgen's wrapper, so a scalar that should explain its format to the

@@ -115,6 +115,19 @@ func newStubSchemaFunc(exec func(context.Context) *graphql.Response) graphql.Exe
 // @param resolve  the body of every root field, with a generated resolver's return shape
 // @return graphql.ExecutableSchema a schema with the single field `Query.ping(at: Time): String`
 func newResolverStubSchema(resolve func(context.Context) (any, error)) graphql.ExecutableSchema {
+	return newScalarStubSchema(resolve, graphql.UnmarshalTime)
+}
+
+// newScalarStubSchema @notice newResolverStubSchema, with at's unmarshalling supplied by the test.
+//
+// @dev The one route by which an UnmarshalGQL's error reaches the presenter is the argument's:
+// ProcessArgField extends the path with the argument's name, and ErrorOnPath wraps the error on it.
+// A scalar of the consumer's own is where a *luimaerr.CustomError comes from on that route.
+//
+// @param resolve    the body of every root field, with a generated resolver's return shape
+// @param unmarshal  what at's value goes through, in place of gqlgen's graphql.UnmarshalTime
+// @return graphql.ExecutableSchema a schema with the single field `Query.ping(at: Time): String`
+func newScalarStubSchema(resolve func(context.Context) (any, error), unmarshal func(any) (time.Time, error)) graphql.ExecutableSchema {
 	return stubSchema{
 		schema: gqlparser.MustLoadSchema(&ast.Source{
 			Name:  "resolver",
@@ -141,7 +154,7 @@ func newResolverStubSchema(resolve func(context.Context) (any, error)) graphql.E
 								if v == nil {
 									return nil, nil
 								}
-								res, err := graphql.UnmarshalTime(v)
+								res, err := unmarshal(v)
 								return &res, graphql.ErrorOnPath(ctx, err)
 							})
 						if err != nil {
