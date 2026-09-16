@@ -21,9 +21,10 @@ and a skip still reports `ok`: `TestCRUD`, `TestStatementTimeout`,
 `TestStatementTimeoutNegativeDisables` and `TestConnectPoolBound`. They are the only ones that reach
 a server, which is where a `SET` that never arrives, a bound Postgres does not enforce and a pool
 left at `database/sql`'s sizing all look exactly like the working thing. Confirm
-`--- PASS: TestCRUD`, not `--- SKIP`. CI pins that one with a `postgres:16` service container and
-greps the `-v` output; the other three run in the same `DATABASE_URL`-set step but are not grepped
-for. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL` (copy
+`--- PASS: TestCRUD`, not `--- SKIP`. CI runs all four against a `postgres:16` service container
+and greps the `-v` output for each one's `^--- PASS: <name> (` — anchored, because
+`TestStatementTimeoutConnParams` needs no database and a prefix match lets it stand in for a skipped
+`TestStatementTimeout`. `TestCRUD` creates and drops its own `luima_test_users` table, so `DATABASE_URL` (copy
 `.env.example` → `.env`, unquoted) is the whole setup.
 
 ## Architecture

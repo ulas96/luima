@@ -75,12 +75,15 @@ jobs:
 
       # All four DB-gated tests, not just TestCRUD: each one t.Skip()s on an empty DATABASE_URL, and
       # a skip reads as ok. TestStatementTimeout and TestConnectPoolBound are the ones that prove
-      # the pgdriver behaviour the bun port turns on.
+      # the pgdriver behaviour the bun port turns on. The pattern is anchored at both ends — a
+      # top-level result starts the line, and the name is followed by " (" — because a prefix
+      # match lets TestStatementTimeoutConnParams, which needs no database, pass for a skipped
+      # TestStatementTimeout.
       - name: confirm the DB-backed tests actually ran
         run: |
           go test -v -count=1 -run 'TestCRUD|TestStatementTimeout|TestConnectPoolBound' ./tests/ | tee out.txt
           for t in TestCRUD TestStatementTimeout TestStatementTimeoutNegativeDisables TestConnectPoolBound; do
-            grep -q -- "--- PASS: $t" out.txt \
+            grep -q -- "^--- PASS: $t (" out.txt \
               || { echo "::error::$t did not run — it skipped, and a skip reads as ok"; exit 1; }
           done
         env:
