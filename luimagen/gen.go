@@ -24,7 +24,7 @@ import (
 type column struct {
 	field  string // Go field name, e.g. "PersonalID"
 	goType string // Go type as given in Field.Type, e.g. "string", "[]string" — written back out verbatim into the generated model struct
-	sql    string // pg column name, derived from field via snakeCase
+	sql    string // SQL column name, derived from field via snakeCase
 	gql    string // GraphQL scalar name: String, Int, Float, or Boolean
 	array  bool   // true when goType has a "[]" prefix
 }
@@ -63,13 +63,13 @@ func tableFromFields(typeName string, fields []Field) (*modelTable, error) {
 			return nil, fmt.Errorf("field %s: %w", f.Name, err)
 		}
 		col := column{field: f.Name, goType: f.Type, sql: cmp.Or(f.Column, snakeCase(f.Name)), gql: gql, array: array}
-		// The same tag rules as Options.Table, because it is written into the same `pg:"…"`.
+		// The same tag rules as Options.Table, because it is written into the same `bun:"…"`.
 		if err := checkTag("column name", col.sql); err != nil {
 			return nil, fmt.Errorf("field %s: %w", f.Name, err)
 		}
 		// Before the PK branch, so the primary key collides with the rest like any other field.
 		if prev, dup := seenCol[col.sql]; dup {
-			return nil, fmt.Errorf("fields %s and %s both map to column %q — the column name derives from the field name (snakeCase) unless Field.Column overrides it, and go-pg would bind two struct fields to one column", prev, f.Name, col.sql)
+			return nil, fmt.Errorf("fields %s and %s both map to column %q — the column name derives from the field name (snakeCase) unless Field.Column overrides it, and bun would bind two struct fields to one column", prev, f.Name, col.sql)
 		}
 		seenCol[col.sql] = f.Name
 		if prev, dup := seenGQL[lowerFirst(f.Name)]; dup {
@@ -135,17 +135,43 @@ func checkIdent(what, name string) error {
 	return nil
 }
 
-// checkTag rejects a SQL name that would not survive being written into a raw-string struct tag.
-// Everything else on the way in is a checked Go identifier; Options.Table and Field.Column are the
-// two values that go into `pg:"…"` verbatim. A backtick terminates the tag literal early
+// checkTag rejects a SQL name that would not survive being written into a raw-string struct tag,
+// or that bun would not read back whole out of one. Everything else on the way in is a checked Go
+// identifier; Options.Table and Field.Column are the two values that go into `bun:"…"` verbatim,
+// and both reach here. A backtick terminates the tag literal early
 // (format.Source then fails at stage 2, after planSDL has already passed), and everything %q
 // escapes — a double quote, a backslash, a tab, any control character — becomes a literal
-// backslash sequence inside the raw string, so go-pg silently reads a name nobody wrote. Testing
+// backslash sequence inside the raw string, so bun silently reads a name nobody wrote. Testing
 // against strconv.Quote catches the whole escaped set rather than the two characters that were
-// obvious. Deliberately not a full identifier check: a schema-qualified "tenant.users" is valid.
+// obvious. Deliberately not a full identifier check: a schema-qualified "tenant.users" is valid —
+// bun splits it on the dot and quotes each half, so the SQL names "tenant"."users"
+// (schema/table.go schemaFromTagName, then quoteIdent).
+//
+// The second rejection is bun's tag grammar rather than Go's, and it is the union of what each
+// half of a tag makes special, because the two names land in different halves and one function
+// checks both: a column name is the tag's *name* (`bun:"projects,array"`) and the table name is an
+// option *value* (`bun:"table:tenant.users"`). ',' separates in both — internal/tagparser's
+// parseKeyValue ends the name there and parseValue ends the value there — so measured on v1.2.18
+// `bun:"pro,jects,array"` binds the column "pro" and `bun:"table:ten,ant"` selects FROM "ten", each
+// with nothing but a WARN about the leftover option. ':' is special in the name half only, where it
+// opens an option: `bun:"pro:jects,array"` leaves Tag.Name empty, so (*Table).newField falls back
+// to its own Underscore(sf.Name) and binds that instead — the same one WARN, naming the leftover
+// option ("pro") and nothing at all about the name substituted for the one the caller wrote.
+// Rejecting ':' in a table name too is the over-strict half of one shared rule, and costs
+// nothing — a table named with a colon is not a name anyone writes, while a column named with one
+// is the case this function exists for: a warning nobody reads, on a model that compiles, binding
+// the wrong column. Neither byte can be escaped past the parser, either: quoting is its own escape,
+// and %q above already rejects the double quote that would open one.
+//
+// '(' is the byte with special meaning that is deliberately let through. parseValue hands it to
+// skipPairs, which scans to the matching ')' and returns the value whole, and parseKeyValue gives
+// it no meaning at all — so both positions keep "ten(ant" intact.
 func checkTag(what, v string) error {
 	if strings.Contains(v, "`") || strconv.Quote(v) != `"`+v+`"` {
-		return fmt.Errorf("%s %q must not contain a backtick or any character %%q escapes (a double quote, a backslash, a tab, a control character) — it is written verbatim into the model's `pg:\"…\"` tag", what, v)
+		return fmt.Errorf("%s %q must not contain a backtick or any character %%q escapes (a double quote, a backslash, a tab, a control character) — it is written verbatim into the model's `bun:\"…\"` tag", what, v)
+	}
+	if i := strings.IndexAny(v, ",:"); i >= 0 {
+		return fmt.Errorf("%s %q must not contain %q — it separates a name from an option in bun's tag grammar (internal/tagparser), so bun would bind a name other than the one written", what, v, v[i:i+1])
 	}
 	return nil
 }
@@ -172,21 +198,26 @@ func scalarType(goType string) (gql string, array bool, err error) {
 	}
 }
 
-// snakeCase derives a pg column name from a Go field name, matching go-pg's own default
-// column-naming convention (internal.Underscore, v10.15.1): an upper-case rune gets a '_'
+// snakeCase derives a SQL column name from a Go field name, matching bun's own default
+// column-naming convention (internal/underscore.go, v1.2.18): an upper-case rune gets a '_'
 // before it when either neighbour is lower-case. The next-rune clause is what handles an
 // initialism followed by a word — URLValue becomes url_value, not urlvalue. checkIdent rejects
 // non-ASCII names before this runs, so the rune loop is belt-and-braces rather than load-bearing;
 // it costs nothing and stays honest if that guard ever moves. What the rule cannot derive is a
-// column with no lower-case neighbour at all — URLID is go-pg's own urlid where the table almost
+// column with no lower-case neighbour at all — URLID is bun's own urlid where the table almost
 // certainly says url_id — and Field.Column is the override for exactly that; docs/luimagen.md §2.1.
+//
+// This function is the one thing the bun port did not have to re-derive: bun's Underscore is
+// byte-identical to the go-pg Underscore it was written against (both internal/underscore.go, and
+// the two files agree line for line through the function), so every column name luimagen has ever
+// derived still lands on the same column and a model whose tags are rewritten keeps binding.
 func snakeCase(s string) string {
 	rs := []rune(s)
 	var b strings.Builder
 	for i, r := range rs {
 		if unicode.IsUpper(r) {
-			// i > 0 gates both clauses, exactly as in go-pg: a leading upper-case rune never
-			// takes an underscore (Name -> name, not _name).
+			// i > 0 gates both clauses, exactly as in bun's Underscore: a leading upper-case rune
+			// never takes an underscore (Name -> name, not _name).
 			if i > 0 && i+1 < len(rs) && (unicode.IsLower(rs[i-1]) || unicode.IsLower(rs[i+1])) {
 				b.WriteByte('_')
 			}
@@ -434,22 +465,47 @@ func writeModel(dir, pkg string, t *modelTable, table string) error {
 
 // modelSource builds the model struct's source text and runs it through format.Source — there
 // is no existing file to preserve here, unlike patch.go's splice, so this is plain templating.
+//
+// The bun import is unconditional because the struct always embeds bun.BaseModel, and that
+// embedded field is the only thing naming the table. An unexported `tableName struct{}` — the
+// spelling a reader porting a model by hand reaches for — is skipped by bun without a word
+// ((*Table).processFields drops every unexported field that is not embedded), leaving the table as
+// the underscored, pluralized type name: measured, a User tagged for app_users that way selects
+// FROM "users", so every query succeeds or fails against the wrong table.
 func modelSource(pkg string, t *modelTable, table string) ([]byte, error) {
 	var b strings.Builder
+	fmt.Fprintf(&b, "package %s\n\nimport %q\n\n", pkg, "github.com/uptrace/bun")
 	// The doc comment is not decoration: .golangci.yml enables revive's `exported` rule, and this
 	// file lands in the consumer's module, so a bare `type User struct` lints as an error on code
 	// they did not write. It also carries the three details the quickstart's hand-written model
 	// explains, which are the three a generated model most needs to explain.
-	fmt.Fprintf(&b, "package %s\n\n// %s @notice The autobound model behind the GraphQL %s type, generated by luimagen.\n//\n// @dev Three things here are load-bearing. tableName names the table, the ,pk tag is mandatory\n// because Get, Update and Delete all call WherePK, and ,array is what keeps a slice column from\n// being encoded as JSONB that an array column rejects. Every field is exported because gqlgen,\n// go-pg and encoding/json all read them by reflection.\n//\n// gqlgen autobinds this type rather than regenerating it — edit it freely.\ntype %s struct {\n",
-		pkg, t.typeName, t.typeName, t.typeName)
-	fmt.Fprintf(&b, "\ttableName struct{} `pg:%q`\n", table)
-	fmt.Fprintf(&b, "\t%s %s `pg:\"%s,pk\"`\n", t.pk.field, t.pk.goType, t.pk.sql)
+	fmt.Fprintf(&b, "// %s @notice The autobound model behind the GraphQL %s type, generated by luimagen.\n",
+		t.typeName, t.typeName)
+	b.WriteString("//\n" +
+		"// @dev Three things here are load-bearing. The embedded bun.BaseModel names the table, the\n" +
+		"// ,pk tag is mandatory because Get, Update and Delete all call WherePK, and ,array is what\n" +
+		"// keeps a slice column from being encoded as JSONB that an array column rejects. Every field\n" +
+		"// is exported because bun and encoding/json read them by reflection, and gqlgen's generated\n" +
+		"// code reads them from another package.\n" +
+		"//\n" +
+		"// The table name is the one that fails quietly. bun skips every unexported field that is not\n" +
+		"// embedded without a word, so naming the table in a `tableName` field — the spelling other\n" +
+		"// Postgres mappers use — compiles, is ignored, and leaves the table as the underscored,\n" +
+		"// pluralized type name. Deleting the embedded line below does not break the build, only the\n" +
+		"// queries.\n" +
+		"//\n" +
+		"// gqlgen autobinds this type rather than regenerating it — edit it freely.\n")
+	fmt.Fprintf(&b, "type %s struct {\n", t.typeName)
+	// The table name goes in the tag's *value* (table:…), which is where bun reads it — and is the
+	// position checkTag's rejection set is verified against.
+	fmt.Fprintf(&b, "\tbun.BaseModel `bun:%q`\n\n", "table:"+table)
+	fmt.Fprintf(&b, "\t%s %s `bun:\"%s,pk\"`\n", t.pk.field, t.pk.goType, t.pk.sql)
 	for _, c := range t.cols {
 		tag := c.sql
 		if c.array {
 			tag += ",array"
 		}
-		fmt.Fprintf(&b, "\t%s %s `pg:\"%s\"`\n", c.field, c.goType, tag)
+		fmt.Fprintf(&b, "\t%s %s `bun:\"%s\"`\n", c.field, c.goType, tag)
 	}
 	b.WriteString("}\n")
 	return format.Source([]byte(b.String()))

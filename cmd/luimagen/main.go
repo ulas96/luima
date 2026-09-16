@@ -39,8 +39,9 @@ func (f *fields) String() string { return fmt.Sprint([]luimagen.Field(*f)) }
 //
 // @dev Split on ':' rather than a struct tag or JSON, because this is typed by hand at a shell
 // prompt; the two optional segments are named rather than positional so neither has to be given
-// to reach the other. A column name holding a ':' is out of reach here — call luimagen.Generate
-// directly for that.
+// to reach the other. A column name holding a ':' is out of reach here, and Generate rejects one
+// too: ':' opens an option in bun's tag grammar, so a column tagged with one binds bun's own
+// derived name instead of the one written (checkTag, luimagen/gen.go).
 // @param v      one -field value as typed
 // @return error names the offending segment; flag prints it and exits
 func (f *fields) Set(v string) error {
